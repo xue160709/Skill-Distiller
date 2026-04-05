@@ -106,6 +106,7 @@ Workspace/<timestamp>/
 ├── report.md              # 人类可读报告（含收敛曲线）
 ├── log.json               # 全部轮次记录
 ├── assertions.json        # 最终检查项集合
+├── failure_modes.json     # 高价值失败模式目录
 ├── baseline/              # Teacher 标杆输出 + reasoning
 ├── iter_0/                # 第 0 轮 Student 输出 + 评估 + 优化
 ├── iter_1/
@@ -129,7 +130,13 @@ Workspace/<timestamp>/
   "id": "paragraph_max_4_sentences",
   "check": "每个段落不超过4句话",
   "source": "reasoning_1.md — 信息密度控制",
-  "weight": 2
+  "weight": 2,
+  "evaluation_method": "code",
+  "code_check": {
+    "type": "max_sentences_per_paragraph",
+    "path": "brief.md",
+    "max_sentences": 4
+  }
 }
 ```
 
@@ -141,6 +148,12 @@ weighted_pass_rate = Σ(passed × weight) / Σ(weight)
 ```
 
 每轮 OPTIMIZE 可追加新 assertions，但**不删除已有的**——标准只增不减。
+
+除 assertions 外，baseline 还会产出一份 `failure_modes.json`，用来记录高价值失败模式。
+后续 `diff_eval`、`blind_eval` 和 `optimize` 会优先参考这份失败模式目录，减少只围绕 baseline 自举的风险。
+
+评测时会优先执行确定性的 `code` assertions，只把剩余的 `judge` assertions 交给 Teacher。
+这样可以减少纯 LLM judge 的波动，让 keep / discard 更依赖可复现检查。
 
 ## Report 示例
 

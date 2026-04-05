@@ -1,8 +1,6 @@
 {
   "teacher": {
-    "env": {
-
-    }
+    "env": {}
   },
   "student": {
     "env": {
@@ -14,10 +12,10 @@
       "ANTHROPIC_MODEL": "glm-5.1"
     }
   },
-  "max_iterations": 15,
-  "target_pass_rate": 0.90,
+  "max_iterations": 3,
+  "target_pass_rate": 0.9,
   "plateau_rounds": 3,
-  "timeout": 600,
+  "timeout": 300,
   "blind_eval_interval": 3,
   "coverage_gap_threshold": 0.2
 }

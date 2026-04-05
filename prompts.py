@@ -10,6 +10,7 @@ def baseline_prompt(
     input_dirs: list[str],
     baseline_dir: str,
     assertions_path: str,
+    failure_modes_path: str = "",
 ) -> str:
     """BASELINE: Teacher 执行标杆 + 推理 + 提取 assertions。"""
 
@@ -48,9 +49,37 @@ def baseline_prompt(
 
 要求：
 - 每条必须可明确判断 pass/fail，不能模糊
+- 优先选择高影响、常出现、可执行的检查项，避免空泛的"质量高""表达好"
 - 每条标注来源（reasoning 中的哪个部分）
 - 每条给权重（1=一般，2=重要，3=关键）
+- 每条必须声明 `evaluation_method`
+  - `code`：只有当检查项能严格映射到下方支持的确定性检查时才能使用
+  - `judge`：其余都使用 Teacher 判定
 - 8-15 条为宜
+
+支持的 `code` 检查类型：
+
+- `file_exists`
+- `contains_all`
+- `contains_any`
+- `not_contains_any`
+- `max_sentences_per_paragraph`
+
+`code` assertion 的 `code_check` 字段格式：
+
+```json
+{{
+    "type": "file_exists | contains_all | contains_any | not_contains_any | max_sentences_per_paragraph",
+    "path": "可选，目标文件相对路径；省略时表示扫描输出目录中的全部文本文件",
+    "phrases": ["用于 contains/not_contains 检查的短语列表"],
+    "case_sensitive": false,
+    "max_sentences": 4
+}}
+```
+
+只有在以上结构足以无歧义完成检查时，才允许选择 `code`。
+凡是涉及风格、逻辑完整性、信息取舍、忠实度、语气、论证质量等主观判断，一律使用 `judge`。
+当 `evaluation_method = "judge"` 时，不要填写 `code_check`。
 
 写入 `{assertions_path}`，格式：
 
@@ -60,7 +89,43 @@ def baseline_prompt(
         "id": "snake_case_id",
         "check": "描述检查条件",
         "source": "reasoning_X.md — 相关段落",
-        "weight": 2
+        "weight": 2,
+        "evaluation_method": "code | judge",
+        "code_check": {{
+            "type": "file_exists",
+            "path": "brief.md"
+        }}
+    }}
+]
+```
+
+## 失败模式目录
+
+另外，写一份失败模式目录到 `{failure_modes_path}`。
+这不是评分结果，而是后续评测和优化要优先关注的失败空间。
+
+要求：
+- 产出 5-10 条最重要的失败模式
+- 必须基于输入任务、你的 baseline 输出、以及推理中暴露的关键决策点
+- 每条失败模式必须原子化，避免把多个问题混成一条
+- 不要使用"整体质量差""不够好"这类空泛表述
+- 优先记录高影响、高频、后续值得进入评测闭环的问题
+
+格式：
+
+```json
+[
+    {{
+        "id": "snake_case_id",
+        "name": "失败模式名称",
+        "description": "什么情况下算这个失败",
+        "severity": "low | medium | high",
+        "why_it_matters": "为什么这个失败重要",
+        "symptoms": [
+            "可观察信号 1",
+            "可观察信号 2"
+        ],
+        "recommended_eval_focus": "后续评测应重点检查什么"
     }}
 ]
 ```
@@ -115,12 +180,21 @@ def evaluate_prompt(
     output_dirs: list[str],
     eval_path: str,
     iteration: int,
+    failure_modes_path: str = "",
 ) -> str:
     """EVALUATE: Teacher 逐条检查 assertions。"""
 
     output_list = "\n".join(
         f"- 输出 {i}: 读取 `{d}` 中的所有文件" for i, d in enumerate(output_dirs)
     )
+    failure_modes_section = ""
+    if failure_modes_path:
+        failure_modes_section = f"""
+
+## 失败模式目录（仅作 gap 诊断参考）
+
+读取 `{failure_modes_path}`。
+可借助这些失败模式来描述 gap，但**不要**因此新增评分标准；最终仍只按 assertions 判分。"""
 
     return f"""你是检查员（Teacher），负责逐条检查 Student 的输出是否满足检查项。
 
@@ -131,6 +205,7 @@ def evaluate_prompt(
 ## 检查项
 
 读取 `{assertions_path}`
+{failure_modes_section}
 
 ## 要求
 
@@ -172,6 +247,7 @@ def evaluate_prompt(
 ## 重要
 
 - 严格基于证据判断，不要猜测
+- 对可客观判断的检查项，优先基于输出中的可验证事实判定，不要做整体印象打分
 - evidence 必须引用 Student 输出中的具体内容
 - gap 要具体描述缺失的知识点
 - pass_rate = passed / total
@@ -189,6 +265,8 @@ def optimize_prompt(
     baseline_dir: str = "",
     diff_eval_path: str = "",
     reasoning_diff_path: str = "",
+    blind_eval_path: str = "",
+    failure_modes_path: str = "",
 ) -> str:
     """OPTIMIZE: Teacher 分析失败项，迁移知识到 Skill。"""
 
@@ -214,6 +292,28 @@ def optimize_prompt(
 - `misunderstanding`（Student 理解偏差）→ 在 Skill 中加正反例纠正
 - `shallow`（方向对但深度不够）→ 在 Skill 中加推理链示范"""
 
+    if blind_eval_path:
+        extra_eval_section += f"""
+
+## 盲评结果
+
+读取 `{blind_eval_path}`。
+关注：
+- `deductions`：真实扣分点
+- `weak_dimensions`：当前输出薄弱维度
+- `uncovered_dimensions`：assertions 尚未充分覆盖、但值得进入闭环的新维度
+
+当 blind eval 与 assertions 评分不一致时，优先相信 blind eval 揭示的漏评问题，并考虑把这些问题转化为更原子的新 assertions。"""
+
+    if failure_modes_path:
+        extra_eval_section += f"""
+
+## 失败模式目录
+
+读取 `{failure_modes_path}`。
+优先修复其中 `severity` 高、且与当前 fail/gap 对应的失败模式。
+不要为了局部措辞优化而忽略高影响失败。"""
+
     # baseline 目录（用于截取正例片段）
     baseline_section = ""
     if baseline_dir:
@@ -228,6 +328,16 @@ def optimize_prompt(
 ## 任务
 
 根据 failed assertions，把 Teacher 的知识迁移到 Skill 中。
+在修改 Skill 时，优先采用 `/.claude/skills/skill-creator` 所代表的“更新现有 skill”工作方式来思考和组织修改。
+也就是说：把当前 `SKILL.md` 当作一个待迭代的 skill 资产来更新，而不是把它当作普通 Markdown 文档随意重写。
+
+## 修改方式
+
+- 明确按“更新已有 skill”的方式工作
+- 优先沿用现有 skill 的结构、章节、frontmatter 和触发描述
+- 只有在确有必要时才重组章节；默认做最小且高价值的增量修改
+- 写出来的内容要像一个可长期维护的 skill，而不是一次性的补丁说明
+- 不要修改 `skill-creator` 本身；只是借鉴它支持的 skill 更新方式来修改当前 skill
 
 ## 当前 Skill
 
@@ -294,6 +404,8 @@ def optimize_prompt(
 ## 重要
 
 - 聚焦于权重高的 failed assertions
+- 若某个新增检查项可以稳定转成受支持的 `code_check`，优先使用 `evaluation_method: "code"`
+- 把这次工作视为一次 skill update，而不是一次自由改写
 - 迁移的是判断逻辑和决策原则，不是具体的输出内容
 - Skill 是给 Student 看的指令，要清晰、可操作
 - 对"感觉类"知识优先用示例迁移——利用 Student 的模仿能力，而非只依赖指令遵循
@@ -304,12 +416,21 @@ def diff_evaluate_prompt(
     baseline_dir: str,
     output_dirs: list[str],
     diff_eval_path: str,
+    failure_modes_path: str = "",
 ) -> str:
     """DIFF_EVALUATE: Teacher 逐段对比标杆输出与 Student 输出。"""
 
     output_list = "\n".join(
         f"- Student 输出 {i}: 读取 `{d}` 中的所有文件" for i, d in enumerate(output_dirs)
     )
+    failure_modes_section = ""
+    if failure_modes_path:
+        failure_modes_section = f"""
+
+## 已知失败模式目录
+
+读取 `{failure_modes_path}`。
+优先关注这些高价值失败模式是否仍有遗漏，也允许发现新的重要差距。"""
 
     return f"""你是对比分析专家（Teacher），负责逐段对比标杆输出与 Student 输出，找出 assertions 可能未覆盖的差距。
 
@@ -320,6 +441,7 @@ def diff_evaluate_prompt(
 ## Student 输出
 
 {output_list}
+{failure_modes_section}
 
 ## 任务
 
@@ -346,7 +468,12 @@ def diff_evaluate_prompt(
                 "suggested_assertion": {{
                     "id": "snake_case_id",
                     "check": "描述检查条件",
-                    "weight": 2
+                    "weight": 2,
+                    "evaluation_method": "code | judge",
+                    "code_check": {{
+                        "type": "file_exists",
+                        "path": "brief.md"
+                    }}
                 }}
             }}
         ]
@@ -359,6 +486,7 @@ def diff_evaluate_prompt(
 - 聚焦于有实质意义的差距，忽略措辞上的微小差异
 - teacher_fragment 和 student_fragment 必须是具体引用，不是概括
 - suggested_assertion 的 check 必须可明确判断 pass/fail
+- 如果 suggested_assertion 可以用确定性规则检查，优先给出 `evaluation_method: "code"` 和完整 `code_check`
 - 每个输入最多报告 5 个最重要的差距"""
 
 
@@ -430,12 +558,21 @@ def blind_eval_prompt(
     output_dirs: list[str],
     blind_eval_path: str,
     iteration: int,
+    failure_modes_path: str = "",
 ) -> str:
     """BLIND_EVAL: Teacher 不看 assertions，直接对 Student 输出打分。"""
 
     output_list = "\n".join(
         f"- 输出 {i}: 读取 `{d}` 中的所有文件" for i, d in enumerate(output_dirs)
     )
+    failure_modes_section = ""
+    if failure_modes_path:
+        failure_modes_section = f"""
+
+## 已知高价值失败模式
+
+读取 `{failure_modes_path}`。
+可参考这些失败模式理解什么问题最重要，但不要机械复述；你的任务是独立识别当前输出真正的薄弱点。"""
 
     return f"""你是质量评估专家（Teacher），负责对 Student 的输出进行独立质量评估。
 
@@ -444,6 +581,7 @@ def blind_eval_prompt(
 ## Student 输出
 
 {output_list}
+{failure_modes_section}
 
 ## 任务
 
@@ -451,7 +589,14 @@ def blind_eval_prompt(
 
 1. 满分 10 分，从专业角度打分
 2. 列出所有扣分项及扣分理由
-3. 识别输出中的薄弱维度
+3. 识别输出中的薄弱维度（`weak_dimensions`）
+4. 识别 3-5 个最值得补进评测闭环的未覆盖维度（`uncovered_dimensions`）
+
+`weak_dimensions` 与 `uncovered_dimensions` 要求：
+- 尽量原子化，一条只描述一个能力缺口
+- 用可转成 assertion 的方式表述，不要用空泛形容词
+- 若已知失败模式目录中有对应项，优先沿用其术语
+- 只有在你认为该维度当前确实影响质量、且值得长期追踪时，才放进 `uncovered_dimensions`
 
 ## 输出
 
@@ -465,13 +610,29 @@ def blind_eval_prompt(
             "input_id": 0,
             "blind_score": 7,
             "max_score": 10,
+            "weak_dimensions": [
+                "忽略已知限制条件",
+                "没有明确点出上线风险"
+            ],
             "deductions": [
-                {{"reason": "扣分理由", "points": -1}},
-                {{"reason": "扣分理由", "points": -2}}
+                {{
+                    "dimension": "忽略已知限制条件",
+                    "reason": "扣分理由",
+                    "points": -1
+                }},
+                {{
+                    "dimension": "没有明确点出上线风险",
+                    "reason": "扣分理由",
+                    "points": -2
+                }}
             ]
         }}
     ],
-    "overall_blind_score": 0.70
+    "overall_blind_score": 0.70,
+    "uncovered_dimensions": [
+        "明确覆盖输入中的限制条件和适用范围",
+        "单独总结 rollout 或 launch 风险"
+    ]
 }}
 ```
 
@@ -480,4 +641,6 @@ def blind_eval_prompt(
 - 完全独立评估，不要参考任何 assertions
 - 评分要严格、客观，基于专业标准
 - deductions 要具体——精确描述问题所在
+- 每条 deduction 尽量绑定一个 `dimension`
+- `uncovered_dimensions` 只保留最值得进入长期评测闭环的 3-5 项，不要泛滥
 - overall_blind_score = 所有 samples 的 blind_score 的平均值 / max_score"""

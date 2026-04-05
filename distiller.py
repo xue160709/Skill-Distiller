@@ -7,6 +7,7 @@ Usage:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,9 @@ from prompts import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+TEXT_FILE_EXTENSIONS = {
+    ".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".tsv", ".html", ".xml"
+}
 
 
 # ─── 配置 & 发现 ───────────────────────────────────────────
@@ -33,10 +37,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 def load_config(path: Path) -> dict:
     """读取并校验 config.json。"""
     cfg = json.loads(path.read_text(encoding="utf-8"))
-    for role in ("teacher", "student"):
-        env = cfg.get(role, {}).get("env", {})
-        if not env.get("ANTHROPIC_MODEL"):
-            sys.exit(f"config.json: {role}.env.ANTHROPIC_MODEL 不能为空")
+    student_env = cfg.get("student", {}).get("env", {})
+    if not student_env.get("ANTHROPIC_MODEL"):
+        sys.exit("config.json: student.env.ANTHROPIC_MODEL 不能为空")
     cfg.setdefault("max_iterations", 15)
     cfg.setdefault("target_pass_rate", 0.90)
     cfg.setdefault("plateau_rounds", 3)
@@ -77,16 +80,18 @@ def run_claude(
     env_config: dict,
     cwd: Path,
     timeout: int = 600,
-    allowed_tools: str = "Read,Write,Edit,Bash",
 ) -> tuple[str, str, int]:
     """调用 claude -p 子进程。"""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    env.update(env_config.get("env", {}))
+    role_env = env_config.get("env", {})
+    if role_env:
+        env.update(role_env)
 
     cmd = [
         "claude", "-p",
+        "--dangerously-skip-permissions",
         "--output-format", "text",
-        "--allowedTools", allowed_tools,
+        "--model", "opus",
     ]
 
     proc = subprocess.run(
@@ -100,6 +105,40 @@ def run_claude(
         timeout=timeout,
     )
     return proc.stdout, proc.stderr, proc.returncode
+
+
+def _normalize_assertion(assertion: dict) -> dict:
+    """补齐 assertion 默认字段，兼容旧格式。"""
+    normalized = dict(assertion)
+    method = normalized.get("evaluation_method", "judge")
+    if method not in {"code", "judge"}:
+        method = "judge"
+    normalized["evaluation_method"] = method
+
+    code_check = normalized.get("code_check")
+    if method == "code" and not isinstance(code_check, dict):
+        normalized["evaluation_method"] = "judge"
+    return normalized
+
+
+def _load_assertions(path: Path) -> list[dict]:
+    """读取 assertions，并对旧格式做兼容归一化。"""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        return []
+    return [_normalize_assertion(a) for a in data if isinstance(a, dict)]
+
+
+def _split_assertions(assertions: list[dict]) -> tuple[list[dict], list[dict]]:
+    """按评测方法拆分 assertions。"""
+    code_assertions = []
+    judge_assertions = []
+    for assertion in assertions:
+        if assertion.get("evaluation_method") == "code":
+            code_assertions.append(assertion)
+        else:
+            judge_assertions.append(assertion)
+    return code_assertions, judge_assertions
 
 
 # ─── Workspace ─────────────────────────────────────────────
@@ -144,12 +183,14 @@ def step_baseline(
     """BASELINE: Teacher 执行标杆 + 推理 + 提取 assertions。"""
     baseline_dir = run_dir / "baseline"
     assertions_path = run_dir / "assertions.json"
+    failure_modes_path = run_dir / "failure_modes.json"
 
     prompt = baseline_prompt(
         skill_content=skill_content,
         input_dirs=[str(d) for d in input_dirs],
         baseline_dir=str(baseline_dir),
         assertions_path=str(assertions_path),
+        failure_modes_path=str(failure_modes_path),
     )
 
     stdout, stderr, rc = run_claude(
@@ -163,6 +204,16 @@ def step_baseline(
 
     if not assertions_path.exists():
         sys.exit("BASELINE 失败: assertions.json 未生成")
+    try:
+        normalized_assertions = _load_assertions(assertions_path)
+        assertions_path.write_text(
+            json.dumps(normalized_assertions, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except json.JSONDecodeError as e:
+        sys.exit(f"BASELINE 失败: assertions.json 解析失败: {e}")
+    if not failure_modes_path.exists():
+        print("  [WARN] failure_modes.json 未生成，后续将退化为纯 assertions 驱动", file=sys.stderr)
 
 
 def step_execute(
@@ -201,32 +252,61 @@ def step_evaluate(
     """EVALUATE: Teacher 逐条检查 assertions。返回 eval 结果或 None。"""
     eval_path = iter_dir / "eval.json"
     assertions_path = run_dir / "assertions.json"
-
+    failure_modes_path = run_dir / "failure_modes.json"
     output_dirs = [str(iter_dir / f"output_{i}") for i in range(len(input_dirs))]
 
-    prompt = evaluate_prompt(
-        assertions_path=str(assertions_path),
-        output_dirs=output_dirs,
-        eval_path=str(eval_path),
-        iteration=iteration,
-    )
-
-    stdout, stderr, rc = run_claude(
-        prompt, config["teacher"], PROJECT_ROOT, config["timeout"]
-    )
-
-    if rc != 0:
-        print(f"  [WARN] evaluate 退出码 {rc}", file=sys.stderr)
-
-    if not eval_path.exists():
-        print("  [ERROR] eval.json 未生成", file=sys.stderr)
-        return None
-
     try:
-        return json.loads(eval_path.read_text(encoding="utf-8"))
+        assertions = _load_assertions(assertions_path)
     except json.JSONDecodeError as e:
-        print(f"  [ERROR] eval.json 解析失败: {e}", file=sys.stderr)
+        print(f"  [ERROR] assertions.json 解析失败: {e}", file=sys.stderr)
         return None
+
+    code_assertions, judge_assertions = _split_assertions(assertions)
+    code_eval_result = _evaluate_code_assertions(code_assertions, output_dirs) if code_assertions else None
+    judge_eval_result = None
+
+    if judge_assertions:
+        judge_assertions_path = iter_dir / "judge_assertions.json"
+        judge_eval_path = iter_dir / "judge_eval.json"
+        judge_assertions_path.write_text(
+            json.dumps(judge_assertions, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        prompt = evaluate_prompt(
+            assertions_path=str(judge_assertions_path),
+            output_dirs=output_dirs,
+            eval_path=str(judge_eval_path),
+            iteration=iteration,
+            failure_modes_path=str(failure_modes_path) if failure_modes_path.exists() else "",
+        )
+
+        stdout, stderr, rc = run_claude(
+            prompt, config["teacher"], PROJECT_ROOT, config["timeout"]
+        )
+
+        if rc != 0:
+            print(f"  [WARN] evaluate 退出码 {rc}", file=sys.stderr)
+
+        if not judge_eval_path.exists():
+            print("  [ERROR] judge_eval.json 未生成", file=sys.stderr)
+            return None
+
+        try:
+            judge_eval_result = json.loads(judge_eval_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"  [ERROR] judge_eval.json 解析失败: {e}", file=sys.stderr)
+            return None
+
+    merged_result = _merge_eval_results(
+        assertions,
+        code_eval_result,
+        judge_eval_result,
+        iteration,
+        len(input_dirs),
+    )
+    eval_path.write_text(json.dumps(merged_result, indent=2, ensure_ascii=False), encoding="utf-8")
+    return merged_result
 
 
 def step_diff_evaluate(
@@ -238,12 +318,14 @@ def step_diff_evaluate(
     """DIFF_EVALUATE: Teacher 逐段对比标杆输出与 Student 输出。"""
     baseline_dir = run_dir / "baseline"
     diff_eval_path = iter_dir / "diff_eval.json"
+    failure_modes_path = run_dir / "failure_modes.json"
     output_dirs = [str(iter_dir / f"output_{i}") for i in range(len(input_dirs))]
 
     prompt = diff_evaluate_prompt(
         baseline_dir=str(baseline_dir),
         output_dirs=output_dirs,
         diff_eval_path=str(diff_eval_path),
+        failure_modes_path=str(failure_modes_path) if failure_modes_path.exists() else "",
     )
 
     stdout, stderr, rc = run_claude(
@@ -315,12 +397,14 @@ def step_blind_eval(
 ) -> dict | None:
     """BLIND_EVAL: Teacher 不看 assertions，直接对 Student 输出打分。"""
     blind_eval_path = iter_dir / "blind_eval.json"
+    failure_modes_path = run_dir / "failure_modes.json"
     output_dirs = [str(iter_dir / f"output_{i}") for i in range(len(input_dirs))]
 
     prompt = blind_eval_prompt(
         output_dirs=output_dirs,
         blind_eval_path=str(blind_eval_path),
         iteration=iteration,
+        failure_modes_path=str(failure_modes_path) if failure_modes_path.exists() else "",
     )
 
     stdout, stderr, rc = run_claude(
@@ -340,19 +424,336 @@ def step_blind_eval(
         return None
 
 
+def _is_probably_text_file(path: Path) -> bool:
+    """粗略判断文件是否适合按文本读取。"""
+    if path.suffix.lower() in TEXT_FILE_EXTENSIONS:
+        return True
+    try:
+        sample = path.read_bytes()[:1024]
+    except OSError:
+        return False
+    return b"\x00" not in sample
+
+
+def _read_text_file(path: Path) -> str:
+    """尽量稳健地读取文本文件。"""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _collect_output_files(output_dir: Path, relative_path: str = "") -> list[Path]:
+    """收集输出目录中的目标文件。"""
+    if relative_path:
+        target = output_dir / relative_path
+        return [target] if target.exists() and target.is_file() else []
+    return sorted(p for p in output_dir.rglob("*") if p.is_file())
+
+
+def _collect_text_blobs(output_dir: Path, relative_path: str = "") -> list[tuple[str, str]]:
+    """读取输出目录中的文本内容。"""
+    blobs: list[tuple[str, str]] = []
+    for path in _collect_output_files(output_dir, relative_path):
+        if not _is_probably_text_file(path):
+            continue
+        text = _read_text_file(path)
+        if not text.strip():
+            continue
+        blobs.append((str(path.relative_to(output_dir)), text))
+    return blobs
+
+
+def _normalize_search_text(text: str, case_sensitive: bool) -> str:
+    """根据大小写配置归一化待搜索文本。"""
+    return text if case_sensitive else text.lower()
+
+
+def _count_sentences(text: str) -> int:
+    """粗略统计段落句数。"""
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    matches = re.findall(r"[。！？!?\.]+", stripped)
+    if matches:
+        return len(matches)
+    return 1
+
+
+def _evaluate_code_assertion_on_output(assertion: dict, output_dir: Path) -> dict:
+    """对单个输出目录执行确定性 assertion 检查。"""
+    code_check = assertion.get("code_check", {}) or {}
+    check_type = code_check.get("type")
+    relative_path = code_check.get("path", "")
+    case_sensitive = bool(code_check.get("case_sensitive", False))
+    phrases = _normalize_text_list(code_check.get("phrases", []))
+    text_blobs = _collect_text_blobs(output_dir, relative_path)
+    joined_text = "\n".join(text for _, text in text_blobs)
+    haystack = _normalize_search_text(joined_text, case_sensitive)
+
+    def fail(evidence: str, gap: str) -> dict:
+        return {
+            "id": assertion.get("id", "unknown"),
+            "passed": False,
+            "evidence": evidence,
+            "gap": gap,
+            "evaluation_method": "code",
+        }
+
+    def passed(evidence: str) -> dict:
+        return {
+            "id": assertion.get("id", "unknown"),
+            "passed": True,
+            "evidence": evidence,
+            "evaluation_method": "code",
+        }
+
+    if check_type == "file_exists":
+        target = output_dir / relative_path
+        if target.exists() and target.is_file():
+            return passed(f"找到目标文件 `{relative_path}`")
+        return fail(f"未找到目标文件 `{relative_path}`", f"缺少必需文件 `{relative_path}`")
+
+    if check_type in {"contains_all", "contains_any", "not_contains_any"}:
+        if not text_blobs:
+            target_desc = relative_path or "输出目录中的文本文件"
+            return fail(f"未找到可读取文本：`{target_desc}`", f"无法在 `{target_desc}` 中验证内容要求")
+        normalized_phrases = [_normalize_search_text(p, case_sensitive) for p in phrases]
+        matches = [phrase for phrase, norm in zip(phrases, normalized_phrases) if norm in haystack]
+        if check_type == "contains_all":
+            missing = [phrase for phrase in phrases if phrase not in matches]
+            if missing:
+                return fail(
+                    f"已匹配 {len(matches)}/{len(phrases)} 个短语；缺失: {', '.join(missing)}",
+                    f"需要明确包含这些短语: {', '.join(missing)}",
+                )
+            return passed(f"已包含全部短语: {', '.join(matches)}")
+        if check_type == "contains_any":
+            if matches:
+                return passed(f"已包含短语: {', '.join(matches)}")
+            return fail(
+                f"未命中任一候选短语: {', '.join(phrases)}",
+                f"至少应包含以下短语之一: {', '.join(phrases)}",
+            )
+        forbidden = matches
+        if forbidden:
+            return fail(
+                f"发现禁用短语: {', '.join(forbidden)}",
+                f"不应出现以下短语: {', '.join(forbidden)}",
+            )
+        return passed(f"未发现禁用短语: {', '.join(phrases)}")
+
+    if check_type == "max_sentences_per_paragraph":
+        max_sentences = code_check.get("max_sentences")
+        if not isinstance(max_sentences, int) or max_sentences <= 0:
+            return fail("code_check.max_sentences 非法", "需要提供正整数的 max_sentences")
+        if not text_blobs:
+            target_desc = relative_path or "输出目录中的文本文件"
+            return fail(f"未找到可读取文本：`{target_desc}`", f"无法在 `{target_desc}` 中验证段落句数")
+        for rel_path, text in text_blobs:
+            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            for paragraph in paragraphs:
+                sentence_count = _count_sentences(paragraph)
+                if sentence_count > max_sentences:
+                    snippet = paragraph.replace("\n", " ")[:120]
+                    return fail(
+                        f"`{rel_path}` 中存在 {sentence_count} 句段落：{snippet}",
+                        f"单段句数超过上限 {max_sentences}",
+                    )
+        target_desc = relative_path or "全部文本文件"
+        return passed(f"`{target_desc}` 中所有段落均不超过 {max_sentences} 句")
+
+    return fail(
+        f"不支持的 code_check.type: `{check_type}`",
+        "该检查类型当前无法用确定性评测执行，请改用 judge 或补充实现",
+    )
+
+
+def _evaluate_code_assertions(assertions: list[dict], output_dirs: list[str]) -> dict:
+    """对全部样本执行确定性 assertion 检查。"""
+    samples = []
+    for i, output_dir in enumerate(output_dirs):
+        results = [
+            _evaluate_code_assertion_on_output(assertion, Path(output_dir))
+            for assertion in assertions
+        ]
+        samples.append({"input_id": i, "results": results})
+    return {"samples": samples}
+
+
+def _summarize_sample_results(results: list[dict], assertions_by_id: dict[str, dict]) -> tuple[float, float]:
+    """按断言权重回算 sample 级 pass_rate。"""
+    if not results:
+        return 0.0, 0.0
+    total = len(results)
+    passed = sum(1 for r in results if r.get("passed"))
+    total_weight = 0.0
+    passed_weight = 0.0
+    for result in results:
+        assertion = assertions_by_id.get(result.get("id", ""), {})
+        weight = float(assertion.get("weight", 1))
+        total_weight += weight
+        if result.get("passed"):
+            passed_weight += weight
+    pass_rate = passed / total if total else 0.0
+    weighted = passed_weight / total_weight if total_weight else 0.0
+    return pass_rate, weighted
+
+
+def _merge_eval_results(
+    assertions: list[dict],
+    code_eval_result: dict | None,
+    judge_eval_result: dict | None,
+    iteration: int,
+    sample_count: int,
+) -> dict:
+    """合并 code / judge 评测结果，并统一回算总分。"""
+    assertions_by_id = {a.get("id", ""): a for a in assertions}
+    code_samples = {s.get("input_id"): s for s in (code_eval_result or {}).get("samples", [])}
+    judge_samples = {s.get("input_id"): s for s in (judge_eval_result or {}).get("samples", [])}
+    merged_samples = []
+    overall_pass = []
+    overall_weighted = []
+
+    for input_id in range(sample_count):
+        code_results = {
+            r.get("id"): r for r in code_samples.get(input_id, {}).get("results", [])
+            if isinstance(r, dict)
+        }
+        judge_results = {
+            r.get("id"): r for r in judge_samples.get(input_id, {}).get("results", [])
+            if isinstance(r, dict)
+        }
+        merged_results = []
+        for assertion in assertions:
+            assertion_id = assertion.get("id", "")
+            result = code_results.get(assertion_id) or judge_results.get(assertion_id)
+            if result is None:
+                result = {
+                    "id": assertion_id,
+                    "passed": False,
+                    "evidence": "评估结果缺失",
+                    "gap": "该检查项未成功完成评测",
+                    "evaluation_method": assertion.get("evaluation_method", "judge"),
+                }
+            merged_results.append(result)
+        pass_rate, weighted = _summarize_sample_results(merged_results, assertions_by_id)
+        overall_pass.append(pass_rate)
+        overall_weighted.append(weighted)
+        merged_samples.append({
+            "input_id": input_id,
+            "results": merged_results,
+            "pass_rate": pass_rate,
+            "weighted_pass_rate": weighted,
+        })
+
+    overall_pass_rate = sum(overall_pass) / len(overall_pass) if overall_pass else 0.0
+    overall_weighted_pass_rate = (
+        sum(overall_weighted) / len(overall_weighted) if overall_weighted else 0.0
+    )
+    return {
+        "iteration": iteration,
+        "samples": merged_samples,
+        "overall_pass_rate": overall_pass_rate,
+        "overall_weighted_pass_rate": overall_weighted_pass_rate,
+    }
+
+
+def _normalize_text_list(values: list) -> list[str]:
+    """规整字符串列表，保留顺序并去重。"""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        text = " ".join(value.strip().split())
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    """将文本转成适合作为 assertion id 的 slug。"""
+    chars = []
+    prev_underscore = False
+    for ch in text.lower():
+        if ch.isascii() and ch.isalnum():
+            chars.append(ch)
+            prev_underscore = False
+            continue
+        if "\u4e00" <= ch <= "\u9fff":
+            chars.append(ch)
+            prev_underscore = False
+            continue
+        if not prev_underscore:
+            chars.append("_")
+            prev_underscore = True
+    slug = "".join(chars).strip("_")
+    slug = "_".join(part for part in slug.split("_") if part)
+    return slug[:max_len] or "dimension"
+
+
+def _extract_uncovered_dimensions(blind_result: dict | None) -> list[str]:
+    """从 blind eval 中提取值得回灌 assertions 的维度。"""
+    if not blind_result:
+        return []
+
+    dims: list[str] = []
+    dims.extend(blind_result.get("uncovered_dimensions", []))
+    for sample in blind_result.get("samples", []):
+        dims.extend(sample.get("weak_dimensions", []))
+        for deduction in sample.get("deductions", []):
+            if isinstance(deduction, dict):
+                dims.append(deduction.get("dimension", ""))
+    return _normalize_text_list(dims)
+
+
+def _compute_overall_blind_score(blind_result: dict | None) -> float:
+    """读取或回算 overall_blind_score。"""
+    if not blind_result:
+        return 0.0
+    score = blind_result.get("overall_blind_score")
+    if isinstance(score, (int, float)):
+        return float(score)
+
+    samples = blind_result.get("samples", [])
+    if not samples:
+        return 0.0
+
+    sample_scores = []
+    for sample in samples:
+        blind_score = sample.get("blind_score")
+        max_score = sample.get("max_score", 10)
+        if not isinstance(blind_score, (int, float)) or not isinstance(max_score, (int, float)):
+            continue
+        if max_score <= 0:
+            continue
+        sample_scores.append(float(blind_score) / float(max_score))
+
+    if not sample_scores:
+        return 0.0
+    return sum(sample_scores) / len(sample_scores)
+
+
 def _merge_assertions_list(run_dir: Path, new_assertions: list[dict]) -> None:
     """将一组 assertions 追加到主 assertions.json。"""
     master_path = run_dir / "assertions.json"
     try:
-        existing = json.loads(master_path.read_text(encoding="utf-8"))
+        existing = _load_assertions(master_path)
     except (json.JSONDecodeError, FileNotFoundError):
         return
 
     existing_ids = {a["id"] for a in existing}
     for a in new_assertions:
-        if a.get("id") and a["id"] not in existing_ids:
-            existing.append(a)
-            existing_ids.add(a["id"])
+        normalized = _normalize_assertion(a)
+        if normalized.get("id") and normalized["id"] not in existing_ids:
+            existing.append(normalized)
+            existing_ids.add(normalized["id"])
 
     master_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -397,6 +798,8 @@ def step_optimize(
         baseline_dir=str(run_dir / "baseline"),
         diff_eval_path=str(iter_dir / "diff_eval.json") if (iter_dir / "diff_eval.json").exists() else "",
         reasoning_diff_path=str(iter_dir / "reasoning_diff.json") if (iter_dir / "reasoning_diff.json").exists() else "",
+        blind_eval_path=str(iter_dir / "blind_eval.json") if (iter_dir / "blind_eval.json").exists() else "",
+        failure_modes_path=str(run_dir / "failure_modes.json") if (run_dir / "failure_modes.json").exists() else "",
     )
 
     stdout, stderr, rc = run_claude(
@@ -434,15 +837,16 @@ def _merge_assertions(run_dir: Path, new_path: Path) -> None:
     master_path = run_dir / "assertions.json"
     try:
         new = json.loads(new_path.read_text(encoding="utf-8"))
-        existing = json.loads(master_path.read_text(encoding="utf-8"))
+        existing = _load_assertions(master_path)
     except (json.JSONDecodeError, FileNotFoundError):
         return
 
     existing_ids = {a["id"] for a in existing}
     for a in new:
-        if a.get("id") and a["id"] not in existing_ids:
-            existing.append(a)
-            existing_ids.add(a["id"])
+        normalized = _normalize_assertion(a)
+        if normalized.get("id") and normalized["id"] not in existing_ids:
+            existing.append(normalized)
+            existing_ids.add(normalized["id"])
 
     master_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -521,10 +925,21 @@ def generate_report(run_dir: Path) -> None:
     # assertions 数量
     assertions_path = run_dir / "assertions.json"
     if assertions_path.exists():
-        assertions = json.loads(assertions_path.read_text(encoding="utf-8"))
+        assertions = _load_assertions(assertions_path)
         assertions_count = len(assertions)
+        code_assertions_count = sum(1 for a in assertions if a.get("evaluation_method") == "code")
+        judge_assertions_count = assertions_count - code_assertions_count
     else:
         assertions_count = "?"
+        code_assertions_count = "?"
+        judge_assertions_count = "?"
+
+    failure_modes_path = run_dir / "failure_modes.json"
+    if failure_modes_path.exists():
+        failure_modes = json.loads(failure_modes_path.read_text(encoding="utf-8"))
+        failure_modes_count = len(failure_modes)
+    else:
+        failure_modes_count = "?"
 
     lines = [
         "# Skill Distiller Report",
@@ -536,6 +951,9 @@ def generate_report(run_dir: Path) -> None:
         f"- 提升: +{final_best - initial:.2f}",
         f"- 迭代轮次: {total_iters}",
         f"- Assertions 数量: {assertions_count}",
+        f"- 其中 code assertions: {code_assertions_count}",
+        f"- 其中 judge assertions: {judge_assertions_count}",
+        f"- Failure modes 数量: {failure_modes_count}",
         f"- 终止原因: {log[-1].get('stop_reason', 'N/A')}",
         "",
         "## 收敛曲线",
@@ -584,6 +1002,9 @@ def generate_report(run_dir: Path) -> None:
                 f"- iter {entry['iteration']}: assertions={entry['score']:.2f}, "
                 f"blind={entry['blind_score']:.2f}, gap={entry['coverage_gap']:.2f}"
             )
+            dims = entry.get("uncovered_dimensions", [])
+            if dims:
+                lines.append(f"  未覆盖维度: {', '.join(dims[:5])}")
 
     report_path = run_dir / "report.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
@@ -712,24 +1133,27 @@ def main():
             print(f"  盲评完成 ({time.time() - t0:.0f}s)")
 
             if blind_result:
-                blind_score = blind_result.get("overall_blind_score", 0.0)
+                blind_score = _compute_overall_blind_score(blind_result)
                 coverage_gap = score - blind_score
+                uncovered = _extract_uncovered_dimensions(blind_result)
                 entry["blind_score"] = blind_score
                 entry["coverage_gap"] = coverage_gap
+                if uncovered:
+                    entry["uncovered_dimensions"] = uncovered
                 print(f"  assertions pass_rate: {score:.2f}, blind_score: {blind_score:.2f}, gap: {coverage_gap:.2f}")
 
                 if coverage_gap > coverage_gap_threshold:
                     print(f"  [WARN] 覆盖率缺口 {coverage_gap:.2f} > {coverage_gap_threshold}，覆盖 plateau 判定")
                     blind_eval_override = True
                     # 将 uncovered_dimensions 转化为新 assertions
-                    uncovered = blind_result.get("uncovered_dimensions", [])
                     if uncovered:
                         new_assertions = []
                         for dim in uncovered:
                             new_assertions.append({
-                                "id": f"blind_{dim.replace(' ', '_').lower()[:40]}",
+                                "id": f"blind_{_slugify(dim)}",
                                 "check": dim,
                                 "weight": 2,
+                                "source": "blind_eval",
                             })
                         _merge_assertions_list(run_dir, new_assertions)
 
