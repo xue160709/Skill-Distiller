@@ -50,12 +50,16 @@ def init_run_log(run_dir: Path) -> Path:
     global _RUN_LOG_PATH
     p = run_dir / "distiller.log"
     _RUN_LOG_PATH = p
+    mode = "a" if p.exists() else "w"
+    header_title = "恢复" if mode == "a" else "启动"
     header = (
-        "Skill Distiller 运行日志\n"
-        f"启动: {datetime.now().isoformat(timespec='seconds')}\n"
+        f"{'=' * 60}\n"
+        f"Skill Distiller 运行日志\n"
+        f"{header_title}: {datetime.now().isoformat(timespec='seconds')}\n"
         f"工作区: {run_dir}\n\n"
     )
-    p.write_text(header, encoding="utf-8")
+    with open(p, mode, encoding="utf-8") as f:
+        f.write(header)
     return p
 
 
@@ -283,6 +287,8 @@ def setup_workspace(
     workspace_root: Path,
     skill_name: str,
     skill_folder: Path,
+    config_path: Path | None = None,
+    input_case_count: int | None = None,
 ) -> tuple[Path, Path]:
     """初始化本次运行目录，安装 skill。
 
@@ -302,7 +308,202 @@ def setup_workspace(
     installed_dir = PROJECT_ROOT / ".claude" / "skills" / skill_name
     _replace_dir(skill_folder, installed_dir)
 
+    run_meta = {
+        "skill_name": skill_name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if config_path is not None:
+        run_meta["config_path"] = str(config_path)
+    if input_case_count is not None:
+        run_meta["input_case_count"] = input_case_count
+    (run_dir / "run_meta.json").write_text(
+        json.dumps(run_meta, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
     return run_dir, installed_dir
+
+
+def _load_log_entries(log_path: Path) -> list[dict]:
+    """读取 log.json，容忍不存在或旧格式异常。"""
+    if not log_path.exists():
+        return []
+    try:
+        data = json.loads(log_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        sys.exit(f"恢复失败: log.json 解析失败: {e}")
+    if not isinstance(data, list):
+        sys.exit("恢复失败: log.json 格式错误，预期为数组")
+    return [entry for entry in data if isinstance(entry, dict)]
+
+
+def _validate_resume_workspace(run_dir: Path, skill_name: str) -> None:
+    """校验恢复目录的关键产物与 skill 一致性。"""
+    if not run_dir.is_dir():
+        sys.exit(f"恢复失败: Workspace 不存在: {run_dir}")
+
+    baseline_dir = run_dir / "baseline"
+    assertions_path = run_dir / "assertions.json"
+    if not baseline_dir.is_dir():
+        sys.exit(f"恢复失败: 缺少 baseline 目录: {baseline_dir}")
+    if not assertions_path.exists():
+        sys.exit(f"恢复失败: 缺少 assertions.json: {assertions_path}")
+
+    run_meta_path = run_dir / "run_meta.json"
+    if run_meta_path.exists():
+        try:
+            run_meta = json.loads(run_meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            sys.exit(f"恢复失败: run_meta.json 解析失败: {e}")
+        recorded_skill = run_meta.get("skill_name")
+        if recorded_skill and recorded_skill != skill_name:
+            sys.exit(
+                f"恢复失败: workspace skill_name={recorded_skill}，当前 SKILL/ 为 {skill_name}"
+            )
+
+    skill_v0_dir = run_dir / "skill_v0"
+    skill_v0_md = skill_v0_dir / "SKILL.md"
+    legacy_skill_v0_md = run_dir / "skill_v0.md"
+    if skill_v0_dir.exists() and not skill_v0_md.exists():
+        sys.exit(f"恢复失败: skill_v0 缺少 SKILL.md: {skill_v0_md}")
+    if not skill_v0_dir.exists() and not legacy_skill_v0_md.exists():
+        sys.exit(
+            f"恢复失败: 缺少 skill_v0 快照: {skill_v0_dir} 或 {legacy_skill_v0_md}"
+        )
+
+
+def _read_skill_snapshot_text(skill_source: Path) -> str:
+    """读取 skill 快照中的 SKILL.md 文本，兼容目录和单文件。"""
+    if skill_source.is_dir():
+        skill_md = skill_source / "SKILL.md"
+    else:
+        skill_md = skill_source
+    if not skill_md.exists():
+        sys.exit(f"恢复失败: 找不到 skill 快照文件: {skill_md}")
+    return skill_md.read_text(encoding="utf-8")
+
+
+def _install_skill_snapshot(skill_source: Path, installed_dir: Path, base_skill_dir: Path) -> None:
+    """将 skill 快照安装到 .claude/skills/，兼容目录和单文件快照。"""
+    if skill_source.is_dir():
+        _replace_dir(skill_source, installed_dir)
+        return
+
+    _replace_dir(base_skill_dir, installed_dir)
+    (installed_dir / "SKILL.md").write_text(
+        skill_source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+
+def _iter_skill_snapshot(iter_dir: Path) -> Path | None:
+    """返回某轮 optimize 产出的 skill 快照路径，兼容新旧布局。"""
+    new_layout = iter_dir / "skill" / "SKILL.md"
+    if new_layout.exists():
+        return iter_dir / "skill"
+
+    legacy_layout = iter_dir / "skill.md"
+    if legacy_layout.exists():
+        return legacy_layout
+    return None
+
+
+def _last_logged_iteration(history: list[dict]) -> int:
+    """返回 log 中最后一个 iteration 编号。"""
+    last_iteration = -1
+    for entry in history:
+        value = entry.get("iteration")
+        if isinstance(value, int):
+            last_iteration = max(last_iteration, value)
+    return last_iteration
+
+
+def _detect_next_iteration(run_dir: Path, history: list[dict], max_iterations: int) -> int:
+    """计算恢复时应从哪一轮开始。"""
+    last_iteration = _last_logged_iteration(history)
+    next_iteration = last_iteration + 1
+
+    for iteration in range(max(next_iteration, 0), max_iterations):
+        if (run_dir / f"iter_{iteration}").exists():
+            return iteration
+    return max(next_iteration, 0)
+
+
+def load_resume_state(run_dir: Path, skill_name: str, config: dict) -> dict:
+    """从已有 workspace 重建恢复所需状态。"""
+    _validate_resume_workspace(run_dir, skill_name)
+
+    installed_skill_dir = PROJECT_ROOT / ".claude" / "skills" / skill_name
+    log_path = run_dir / "log.json"
+    history = _load_log_entries(log_path)
+    if history and history[-1].get("stop_reason"):
+        sys.exit(
+            f"恢复失败: 实验已结束，stop_reason={history[-1].get('stop_reason')}"
+        )
+
+    skill_v0_dir = run_dir / "skill_v0"
+    legacy_skill_v0_md = run_dir / "skill_v0.md"
+    if skill_v0_dir.exists():
+        initial_skill_source = skill_v0_dir
+        base_skill_dir = skill_v0_dir
+    elif legacy_skill_v0_md.exists():
+        initial_skill_source = legacy_skill_v0_md
+        base_skill_dir = PROJECT_ROOT / "SKILL" / skill_name
+    else:
+        sys.exit("恢复失败: 既找不到 skill_v0/，也找不到 skill_v0.md")
+
+    current_skill_source = initial_skill_source
+    best_skill_source = initial_skill_source
+    best_core_score = 0.0
+    optimize_rounds_completed = 0
+
+    for entry in history:
+        iteration = entry.get("iteration")
+        if not isinstance(iteration, int):
+            continue
+
+        action = entry.get("action")
+        if action == "keep":
+            best_skill_source = current_skill_source
+            best_core_score = float(entry.get("best_score", best_core_score))
+
+        post_score_skill_source = current_skill_source if action == "keep" else best_skill_source
+
+        if entry.get("stop_reason"):
+            current_skill_source = post_score_skill_source
+            break
+
+        optimized_skill_source = _iter_skill_snapshot(run_dir / f"iter_{iteration}")
+        if optimized_skill_source is not None:
+            current_skill_source = optimized_skill_source
+            optimize_rounds_completed += 1
+        else:
+            current_skill_source = post_score_skill_source
+
+        best_core_score = float(entry.get("best_score", best_core_score))
+
+    best_skill_dir = run_dir / "best_skill"
+    if best_skill_dir.exists():
+        best_skill_source = best_skill_dir
+    else:
+        _install_skill_snapshot(best_skill_source, best_skill_dir, base_skill_dir)
+        best_skill_source = best_skill_dir
+
+    next_iteration = _detect_next_iteration(run_dir, history, config["max_iterations"])
+    _install_skill_snapshot(current_skill_source, installed_skill_dir, base_skill_dir)
+
+    return {
+        "run_dir": run_dir,
+        "installed_skill_dir": installed_skill_dir,
+        "best_skill_dir": best_skill_dir,
+        "skill_content": _read_skill_snapshot_text(current_skill_source),
+        "best_skill": _read_skill_snapshot_text(best_skill_source),
+        "best_core_score": best_core_score,
+        "history": history,
+        "log_path": log_path,
+        "optimize_rounds_completed": optimize_rounds_completed,
+        "next_iteration": next_iteration,
+    }
 
 
 # ─── 管道步骤 ──────────────────────────────────────────────
@@ -1376,44 +1577,77 @@ def finalize(
 
 
 def main():
+    if len(sys.argv) > 3:
+        sys.exit("Usage: python distiller.py [config.json] [Workspace/<timestamp>]")
+
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else PROJECT_ROOT / "config.json"
+    resume_run_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else None
     config = load_config(config_path)
 
     skill_name, skill_folder = discover_skill(PROJECT_ROOT / "SKILL")
     input_dirs = discover_inputs(PROJECT_ROOT / "Input")
 
-    # 初始化 workspace + 文件日志（distiller.log）
-    run_dir, installed_skill_dir = setup_workspace(
-        PROJECT_ROOT / "Workspace", skill_name, skill_folder
-    )
-    init_run_log(run_dir)
-    run_log_print(f"[INFO] Skill: {skill_name}")
-    run_log_print(f"[INFO] Inputs: {len(input_dirs)} case(s)")
-    run_log_print(f"[INFO] Workspace: {run_dir}")
-    run_log_print(f"[INFO] 运行日志文件: {run_dir / 'distiller.log'}")
+    if resume_run_dir is None:
+        run_dir, installed_skill_dir = setup_workspace(
+            PROJECT_ROOT / "Workspace",
+            skill_name,
+            skill_folder,
+            config_path=config_path,
+            input_case_count=len(input_dirs),
+        )
+        init_run_log(run_dir)
+        run_log_print(f"[INFO] Skill: {skill_name}")
+        run_log_print(f"[INFO] Inputs: {len(input_dirs)} case(s)")
+        run_log_print(f"[INFO] Workspace: {run_dir}")
+        run_log_print(f"[INFO] 运行日志文件: {run_dir / 'distiller.log'}")
 
-    installed_skill_path = installed_skill_dir / "SKILL.md"
-    skill_content = installed_skill_path.read_text(encoding="utf-8")
-    best_skill_dir = run_dir / "best_skill"
-    _replace_dir(installed_skill_dir, best_skill_dir)
+        installed_skill_path = installed_skill_dir / "SKILL.md"
+        skill_content = installed_skill_path.read_text(encoding="utf-8")
+        best_skill_dir = run_dir / "best_skill"
+        _replace_dir(installed_skill_dir, best_skill_dir)
 
-    # ── BASELINE ──
-    run_log_print(f"\n[BASELINE] Teacher 执行 {skill_name}...")
-    t0 = time.time()
-    step_baseline(config, skill_content, input_dirs, run_dir)
-    run_log_print(f"[BASELINE] 完成 ({time.time() - t0:.0f}s)")
+        run_log_print(f"\n[BASELINE] Teacher 执行 {skill_name}...")
+        t0 = time.time()
+        step_baseline(config, skill_content, input_dirs, run_dir)
+        run_log_print(f"[BASELINE] 完成 ({time.time() - t0:.0f}s)")
 
-    # ── 迭代循环 ──
-    best_core_score = 0.0
-    best_skill = skill_content
-    history: list[dict] = []
-    log_path = run_dir / "log.json"
+        best_core_score = 0.0
+        best_skill = skill_content
+        history: list[dict] = []
+        log_path = run_dir / "log.json"
+        next_iteration = 0
+        optimize_rounds_completed = 0
+    else:
+        resume_state = load_resume_state(resume_run_dir, skill_name, config)
+        run_dir = resume_state["run_dir"]
+        installed_skill_dir = resume_state["installed_skill_dir"]
+        best_skill_dir = resume_state["best_skill_dir"]
+        skill_content = resume_state["skill_content"]
+        best_skill = resume_state["best_skill"]
+        best_core_score = resume_state["best_core_score"]
+        history = resume_state["history"]
+        log_path = resume_state["log_path"]
+        optimize_rounds_completed = resume_state["optimize_rounds_completed"]
+        next_iteration = resume_state["next_iteration"]
+
+        init_run_log(run_dir)
+        run_log_print(f"[INFO] Skill: {skill_name}")
+        run_log_print(f"[INFO] Inputs: {len(input_dirs)} case(s)")
+        run_log_print(f"[INFO] Workspace: {run_dir}")
+        run_log_print(f"[INFO] 运行日志文件: {run_dir / 'distiller.log'}")
+        run_log_print(f"[INFO] Resume: from iter_{next_iteration}")
+        run_log_print(
+            f"[INFO] Resume state: best_core={best_core_score:.2f}, "
+            f"history={len(history)}, optimize_rounds={optimize_rounds_completed}"
+        )
+
     blind_eval_interval = config.get("blind_eval_interval", 3)
     coverage_gap_threshold = config.get("coverage_gap_threshold", 0.2)
-    optimize_rounds_completed = 0
 
-    for iteration in range(config["max_iterations"]):
+    for iteration in range(next_iteration, config["max_iterations"]):
         iter_dir = run_dir / f"iter_{iteration}"
+        if resume_run_dir is not None and iter_dir.exists():
+            shutil.rmtree(iter_dir)
         iter_dir.mkdir(exist_ok=True)
 
         # EXECUTE
