@@ -301,10 +301,10 @@ def evaluate_prompt(
 
 
 def optimize_prompt(
-    skill_path: str,
+    skill_dir: str,
     eval_path: str,
     reasoning_dir: str,
-    output_skill_path: str,
+    output_skill_dir: str,
     change_path: str,
     new_assertions_path: str,
     iteration: int,
@@ -384,20 +384,25 @@ def optimize_prompt(
 ## 任务
 
 根据 failed assertions，把 Teacher 的知识迁移到 Skill 中。
-在修改 Skill 时，优先采用 `/.claude/skills/skill-creator` 所代表的“更新现有 skill”工作方式来思考和组织修改。
-也就是说：把当前 `SKILL.md` 当作一个待迭代的 skill 资产来更新，而不是把它当作普通 Markdown 文档随意重写。
+这一步必须显式使用 `skill-creator` 技能，以“更新现有 skill”的方式工作。
+不要只改一个 `SKILL.md` 文件；要把当前 skill 视为一个完整目录资产，必要时连同 `references/`、`scripts/`、`assets/`、`agents/openai.yaml` 一起更新。
 
 ## 修改方式
 
-- 明确按“更新已有 skill”的方式工作
-- 优先沿用现有 skill 的结构、章节、frontmatter 和触发描述
+- 第一步：调用 `skill-creator`，并按它对“更新现有 skill”的要求来审视当前 skill 目录
+- 优先沿用现有 skill 的结构、章节、frontmatter、触发描述与目录组织
 - 只有在确有必要时才重组章节；默认做最小且高价值的增量修改
 - 写出来的内容要像一个可长期维护的 skill，而不是一次性的补丁说明
-- 不要修改 `skill-creator` 本身；只是借鉴它支持的 skill 更新方式来修改当前 skill
+- 可以新增、修改或删除当前 skill 目录内的资源文件，但不要修改 `skill-creator` 本身
 
 ## 当前 Skill
 
-读取 `{skill_path}`
+读取 `{skill_dir}` 整个目录，而不只是其中的 `SKILL.md`。
+特别注意：
+- 若已有 `references/`，优先把长说明、参考材料、模式说明放到其中，而不是把所有细节塞进 `SKILL.md`
+- 若已有或需要 `scripts/`，可把需要稳定执行的流程沉淀为脚本
+- 若存在 `agents/openai.yaml`，更新 skill 后检查它是否仍与 `SKILL.md` 一致；必要时一并更新
+- 保持 skill 的触发语义与目录可维护性
 
 ## 评估结果
 
@@ -442,14 +447,17 @@ def optimize_prompt(
 ## 约束
 
 - 每轮最多迁移 3 条知识（聚焦最重要的 gap）
-- 修改后的 Skill 长度不超过前一版的 150%
-- 不要删除 Skill 中已有的有效指令
+- 修改后的 `SKILL.md` 长度不超过前一版的 150%
+- 不要删除 Skill 中已有的有效指令，除非它们与更高优先级的新规则直接冲突
 - 保持 Skill 的 YAML frontmatter 不变
-- 新增的指令要自然融入 Skill 的结构
+- 新增的指令和资源要自然融入 skill 的整体结构
+- 若需要新增参考文档、脚本或其他资源，务必在 `SKILL.md` 中给出清晰入口，符合 skill-creator 的渐进披露原则
 
 ## 输出
 
-1. 修改后的 SKILL.md → 写入 `{output_skill_path}`
+1. 修改后的完整 skill 目录 → 写入 `{output_skill_dir}`
+   - 目录中必须包含 `SKILL.md`
+   - 如果需要新增或更新 `references/`、`scripts/`、`assets/`、`agents/openai.yaml`，也写入该目录
 2. 修改说明 → 写入 `{change_path}`，包含：
    - 本轮迁移了哪些知识
    - 每条知识的 `transfer_type`（"rule" 或 "example"）
@@ -463,6 +471,7 @@ def optimize_prompt(
 
 ## 重要
 
+- 明确使用 `skill-creator`技能 来完成这次 skill update
 - 聚焦于权重高的 failed assertions
 - 若某个新增检查项可以稳定转成受支持的 `code_check`，优先使用 `evaluation_method: "code"`
 - 把这次工作视为一次 skill update，而不是一次自由改写

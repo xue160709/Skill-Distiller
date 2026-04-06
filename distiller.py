@@ -272,6 +272,13 @@ def _assertion_applies_to_input(assertion: dict, input_id: int) -> bool:
 # ─── Workspace ─────────────────────────────────────────────
 
 
+def _replace_dir(src: Path, dst: Path) -> None:
+    """用 src 的完整内容替换 dst。"""
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+
+
 def setup_workspace(
     workspace_root: Path,
     skill_name: str,
@@ -279,7 +286,7 @@ def setup_workspace(
 ) -> tuple[Path, Path]:
     """初始化本次运行目录，安装 skill。
 
-    返回: (run_dir, installed_skill_md_path)
+    返回: (run_dir, installed_skill_dir)
     """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     run_dir = workspace_root / timestamp
@@ -289,14 +296,13 @@ def setup_workspace(
     # 备份原始 skill
     src_skill_md = skill_folder / "SKILL.md"
     shutil.copy2(src_skill_md, run_dir / "skill_v0.md")
+    _replace_dir(skill_folder, run_dir / "skill_v0")
 
     # 安装 skill 到 .claude/skills/
     installed_dir = PROJECT_ROOT / ".claude" / "skills" / skill_name
-    if installed_dir.exists():
-        shutil.rmtree(installed_dir)
-    shutil.copytree(skill_folder, installed_dir)
+    _replace_dir(skill_folder, installed_dir)
 
-    return run_dir, installed_dir / "SKILL.md"
+    return run_dir, installed_dir
 
 
 # ─── 管道步骤 ──────────────────────────────────────────────
@@ -1106,22 +1112,23 @@ def step_score(
 
 def step_optimize(
     config: dict,
-    installed_skill_path: Path,
+    installed_skill_dir: Path,
     iter_dir: Path,
     run_dir: Path,
     iteration: int,
 ) -> str | None:
     """OPTIMIZE: Teacher 迁移知识到 Skill。返回新 skill 内容或 None。"""
-    output_skill_path = iter_dir / "skill.md"
+    output_skill_dir = iter_dir / "skill"
+    output_skill_path = output_skill_dir / "SKILL.md"
     change_path = iter_dir / "change.md"
     new_assertions_path = iter_dir / "new_assertions.json"
     knowledge_path = _build_knowledge_candidates(iter_dir)
 
     prompt = optimize_prompt(
-        skill_path=str(installed_skill_path),
+        skill_dir=str(installed_skill_dir),
         eval_path=str(iter_dir / "eval.json"),
         reasoning_dir=str(run_dir / "baseline"),
-        output_skill_path=str(output_skill_path),
+        output_skill_dir=str(output_skill_dir),
         change_path=str(change_path),
         new_assertions_path=str(new_assertions_path),
         iteration=iteration,
@@ -1145,7 +1152,7 @@ def step_optimize(
         run_log_print(f"  [WARN] optimize 退出码 {rc}", file=sys.stderr)
 
     if not output_skill_path.exists():
-        run_log_print("  [ERROR] optimize 未生成新 skill.md", file=sys.stderr)
+        run_log_print("  [ERROR] optimize 未生成新的 skill 目录或其中缺少 SKILL.md", file=sys.stderr)
         return None
 
     new_skill = output_skill_path.read_text(encoding="utf-8")
@@ -1155,8 +1162,8 @@ def step_optimize(
         run_log_print("  [WARN] 新 skill 缺少 YAML frontmatter，拒绝采用", file=sys.stderr)
         return None
 
-    # 更新已安装的 skill
-    installed_skill_path.write_text(new_skill, encoding="utf-8")
+    # 更新已安装的整套 skill 目录
+    _replace_dir(output_skill_dir, installed_skill_dir)
 
     # 合并新 assertions
     _merge_assertions(run_dir, new_assertions_path)
@@ -1353,18 +1360,14 @@ def generate_report(run_dir: Path) -> None:
 
 
 def finalize(
-    best_skill: str,
+    best_skill_dir: Path,
     skill_name: str,
-    skill_folder: Path,
     final_root: Path,
     run_dir: Path,
 ) -> None:
     """复制最佳 skill 到 Final/，生成报告。"""
     final_dir = final_root / skill_name
-    if final_dir.exists():
-        shutil.rmtree(final_dir)
-    shutil.copytree(skill_folder, final_dir)
-    (final_dir / "SKILL.md").write_text(best_skill, encoding="utf-8")
+    _replace_dir(best_skill_dir, final_dir)
 
     generate_report(run_dir)
 
@@ -1380,7 +1383,7 @@ def main():
     input_dirs = discover_inputs(PROJECT_ROOT / "Input")
 
     # 初始化 workspace + 文件日志（distiller.log）
-    run_dir, installed_skill_path = setup_workspace(
+    run_dir, installed_skill_dir = setup_workspace(
         PROJECT_ROOT / "Workspace", skill_name, skill_folder
     )
     init_run_log(run_dir)
@@ -1389,7 +1392,10 @@ def main():
     run_log_print(f"[INFO] Workspace: {run_dir}")
     run_log_print(f"[INFO] 运行日志文件: {run_dir / 'distiller.log'}")
 
+    installed_skill_path = installed_skill_dir / "SKILL.md"
     skill_content = installed_skill_path.read_text(encoding="utf-8")
+    best_skill_dir = run_dir / "best_skill"
+    _replace_dir(installed_skill_dir, best_skill_dir)
 
     # ── BASELINE ──
     run_log_print(f"\n[BASELINE] Teacher 执行 {skill_name}...")
@@ -1445,10 +1451,12 @@ def main():
 
         if action == "keep":
             best_skill = skill_content
+            _replace_dir(installed_skill_dir, best_skill_dir)
             run_log_print(f"[ITER {iteration}] ✓ core={core_score:.2f} (new best)")
         else:
             skill_content = best_skill
-            installed_skill_path.write_text(best_skill, encoding="utf-8")
+            _replace_dir(best_skill_dir, installed_skill_dir)
+            installed_skill_path = installed_skill_dir / "SKILL.md"
             if not artifact_gate_passed:
                 run_log_print(f"[ITER {iteration}] ✗ artifact gate failed, rollback")
             else:
@@ -1525,7 +1533,7 @@ def main():
         # OPTIMIZE
         run_log_print(f"[ITER {iteration}] Teacher 优化中...")
         t0 = time.time()
-        new_skill = step_optimize(config, installed_skill_path, iter_dir, run_dir, iteration)
+        new_skill = step_optimize(config, installed_skill_dir, iter_dir, run_dir, iteration)
         run_log_print(f"  优化完成 ({time.time() - t0:.0f}s)")
         optimize_rounds_completed += 1
 
@@ -1536,7 +1544,7 @@ def main():
 
     # ── FINALIZE ──
     run_log_print(f"\n[FINALIZE]")
-    finalize(best_skill, skill_name, skill_folder, PROJECT_ROOT / "Final", run_dir)
+    finalize(best_skill_dir, skill_name, PROJECT_ROOT / "Final", run_dir)
     run_log_print(f"  最终 core pass_rate: {best_core_score:.2f}")
     run_log_print(f"  Final skill: Final/{skill_name}/SKILL.md")
     run_log_print(f"  Report: {run_dir}/report.md")
