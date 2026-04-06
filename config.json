@@ -17,7 +17,7 @@
   "max_iterations": 15,
   "target_pass_rate": 0.90,
   "plateau_rounds": 3,
-  "timeout": 600,
+  "max_runtime_seconds": 1200,
   "blind_eval_interval": 3,
   "coverage_gap_threshold": 0.2
 }

@@ -6,16 +6,16 @@
     "env": {
       "ANTHROPIC_AUTH_TOKEN": "250c92f99eeb4a05a8eec4c4b7dc7a60.obOivZ5iOGcmW7EB",
       "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
-      "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.1",
-      "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.1",
-      "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.1",
-      "ANTHROPIC_MODEL": "glm-5.1"
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
+      "ANTHROPIC_MODEL": "glm-4.7"
     }
   },
   "max_iterations": 3,
   "target_pass_rate": 0.9,
   "plateau_rounds": 3,
-  "timeout": 300,
+  "max_runtime_seconds": 1200,
   "blind_eval_interval": 3,
   "coverage_gap_threshold": 0.2
 }

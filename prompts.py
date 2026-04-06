@@ -52,10 +52,17 @@ def baseline_prompt(
 - 优先选择高影响、常出现、可执行的检查项，避免空泛的"质量高""表达好"
 - 每条标注来源（reasoning 中的哪个部分）
 - 每条给权重（1=一般，2=重要，3=关键）
+- 权重要体现真正的质量杠杆：
+  - `3` 只给缺失后会明显拉低整体质量的关键项（核心洞察、关键逻辑链、解法可操作性、关键结构闭环、关键证据质量）
+  - `2` 给重要但非致命项
+  - `1` 给纯格式/合规/辅助项
+- 不要让大量格式项占满高权重；`code` assertion 默认应偏低权重，除非缺失会直接导致任务失败
+- 至少产出 4 条 `judge` 类关键断言（weight=3），并确保它们真的能拉开 Teacher / Student 的质量差距
+- 避免只写"是否出现了某元素"；更优先写"该元素是否达到足够质量门槛"
 - 每条必须声明 `evaluation_method`
   - `code`：只有当检查项能严格映射到下方支持的确定性检查时才能使用
   - `judge`：其余都使用 Teacher 判定
-- 8-15 条为宜
+- 8-12 条为宜；宁可少而锋利，也不要多而松
 
 支持的 `code` 检查类型：
 
@@ -64,22 +71,36 @@ def baseline_prompt(
 - `contains_any`
 - `not_contains_any`
 - `max_sentences_per_paragraph`
+- `no_pattern_match`
 
 `code` assertion 的 `code_check` 字段格式：
 
 ```json
 {{
-    "type": "file_exists | contains_all | contains_any | not_contains_any | max_sentences_per_paragraph",
-    "path": "可选，目标文件相对路径；省略时表示扫描输出目录中的全部文本文件",
+    "type": "file_exists | contains_all | contains_any | not_contains_any | max_sentences_per_paragraph | no_pattern_match",
+    "path": "可选，目标文件相对路径；若 target=article 且省略，默认只检查 article.md",
     "phrases": ["用于 contains/not_contains 检查的短语列表"],
     "case_sensitive": false,
-    "max_sentences": 4
+    "max_sentences": 4,
+    "pattern": "用于 no_pattern_match 的正则"
 }}
 ```
 
 只有在以上结构足以无歧义完成检查时，才允许选择 `code`。
 凡是涉及风格、逻辑完整性、信息取舍、忠实度、语气、论证质量等主观判断，一律使用 `judge`。
 当 `evaluation_method = "judge"` 时，不要填写 `code_check`。
+每条 assertion 还必须声明：
+
+- `layer`：`artifact | core | scoped`
+- `target`：`article | process`
+- `applies_to_inputs`：`all` 或输入 id 列表（如 `[0]`、`[1]`、`[0, 1]`）
+
+规则：
+
+- `artifact`：最终交付物的格式/合规检查
+- `core`：跨输入通用的关键质量标准
+- `scoped`：只适用于部分输入的标准，必须通过 `applies_to_inputs` 明确标出
+- 面向最终成文的 code assertion，优先使用 `target: "article"`，并让检查只落在 `article.md`
 
 写入 `{assertions_path}`，格式：
 
@@ -89,6 +110,9 @@ def baseline_prompt(
         "id": "snake_case_id",
         "check": "描述检查条件",
         "source": "reasoning_X.md — 相关段落",
+        "layer": "artifact | core | scoped",
+        "target": "article | process",
+        "applies_to_inputs": "all | [0] | [1] | [0, 1]",
         "weight": 2,
         "evaluation_method": "code | judge",
         "code_check": {{
@@ -213,6 +237,26 @@ def evaluate_prompt(
 - 判断 pass 或 fail
 - 附带 evidence（引用 Student 输出中的具体内容）
 - 如果 fail，附带 gap（Student 缺失了什么知识）
+- 对 `judge` assertion，评估标准是“是否达到 Teacher baseline 级别的完成度”，不是“是否大致沾到这个元素”
+- 如果 Student 只有表面对应元素，但深度、独特性、论证力度、可操作性明显弱于高质量标准，应判 fail，不要因为“差不多有”就判 pass
+- 如果你在 pass / fail 之间犹豫，默认判 fail
+- 重大缺口必须反映到正式评分里，不能只在心里觉得差、却仍然判 pass
+
+## 重大缺口处理规则
+
+以下任一情况出现时，相关 assertion 应优先判 fail，而不是给“勉强通过”：
+- 核心洞察缺失，只剩表层复述
+- 逻辑链关键跳步（问题直接跳解法、缺少必要推导/过渡）
+- 解法停留在口号或方向感，没有可操作动作/练习路径
+- 类比只出现名词，没有说明相似点或为何能支撑论证
+- 结尾没有形成压缩句、闭环或可带走的核心判断
+- 证据/权威引用明显弱化为模糊表述，无法支撑核心论点
+
+## 校准原则
+
+- 不要因为文章整体流畅、语言顺滑，就补偿关键缺失
+- 不要把“有这个部分”当作“这个部分做对了”
+- 当某个高权重 assertion fail 时，sample 的整体质量应明显下调
 
 将结果写入 `{eval_path}`，严格使用以下 JSON 格式：
 
@@ -232,6 +276,7 @@ def evaluate_prompt(
                     "id": "assertion_id",
                     "passed": false,
                     "evidence": "具体证据",
+                    "why_not_enough": "虽然出现了相关元素，但为什么仍未达到要求",
                     "gap": "Student 缺失的知识"
                 }}
             ],
@@ -249,6 +294,7 @@ def evaluate_prompt(
 - 严格基于证据判断，不要猜测
 - 对可客观判断的检查项，优先基于输出中的可验证事实判定，不要做整体印象打分
 - evidence 必须引用 Student 输出中的具体内容
+- fail 时优先补充 `why_not_enough`，解释为什么“有但不够”仍应失败
 - gap 要具体描述缺失的知识点
 - pass_rate = passed / total
 - weighted_pass_rate = sum(passed * weight) / sum(weight)"""
@@ -265,6 +311,7 @@ def optimize_prompt(
     baseline_dir: str = "",
     diff_eval_path: str = "",
     reasoning_diff_path: str = "",
+    knowledge_path: str = "",
     blind_eval_path: str = "",
     failure_modes_path: str = "",
 ) -> str:
@@ -291,6 +338,15 @@ def optimize_prompt(
 - `missing`（Student 完全不知道）→ 在 Skill 中补充规则
 - `misunderstanding`（Student 理解偏差）→ 在 Skill 中加正反例纠正
 - `shallow`（方向对但深度不够）→ 在 Skill 中加推理链示范"""
+
+    if knowledge_path:
+        extra_eval_section += f"""
+
+## 可迁移知识候选
+
+读取 `{knowledge_path}`。
+这里已经汇总了本轮 diff / reasoning diff 中最值得写回 Skill 的候选知识。
+默认优先从这里挑选 1-3 条真正高杠杆的知识写回 Skill，而不是只修表层措辞。"""
 
     if blind_eval_path:
         extra_eval_section += f"""
@@ -400,6 +456,10 @@ def optimize_prompt(
    - 每条知识来自哪个 reasoning 文件
    - 预期能修复哪些 failed assertions
 3. 如发现需要新增检查项 → 写入 `{new_assertions_path}`，格式同 assertions.json
+   - 新 assertion 必须显式带上 `layer`
+   - 若是面向最终成文的检查，设 `target: "article"`
+   - 若只适用于部分输入，显式写 `applies_to_inputs`
+   - 只允许使用受支持的 `code_check.type`，不要发明新类型
 
 ## 重要
 
@@ -409,6 +469,8 @@ def optimize_prompt(
 - 迁移的是判断逻辑和决策原则，不是具体的输出内容
 - Skill 是给 Student 看的指令，要清晰、可操作
 - 对"感觉类"知识优先用示例迁移——利用 Student 的模仿能力，而非只依赖指令遵循
+- 优先写回那些在 diff / reasoning diff 中重复出现、且能解释高权重失败或明显质量落差的知识
+- 如果 eval 分数已经很高，但 diff / reasoning diff 仍揭示出关键质量差距，仍然必须迁移知识；不要因为“分数够了”而空转
 - 这是第 {iteration} 轮优化"""
 
 
