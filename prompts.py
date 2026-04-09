@@ -1,7 +1,11 @@
-"""Skill Distiller prompt 模板。
+"""Skill Distiller prompt templates / Skill Distiller 的 Prompt 模板。
 
-prompt 函数，每个返回一个字符串 prompt，传给 claude -p 子进程。
-Prompt 指示 Claude 读取输入文件、执行任务、写入输出文件。
+这些函数返回完整的字符串 prompt，交给 `claude -p` 子进程执行。
+These functions return complete string prompts for the `claude -p` subprocess.
+
+模块本身不保存运行状态，只负责把阶段上下文拼装成可执行指令。
+The module is intentionally stateless and only assembles stage context into
+executable instructions.
 """
 
 
@@ -12,7 +16,11 @@ def baseline_prompt(
     assertions_path: str,
     failure_modes_path: str = "",
 ) -> str:
-    """BASELINE: Teacher 执行标杆 + 推理 + 提取 assertions。"""
+    """BASELINE 阶段 / Baseline stage.
+
+    产出 benchmark、reasoning、assertions 与 failure modes。
+    Produce the benchmark, reasoning traces, assertions, and failure modes.
+    """
 
     input_list = "\n".join(
         f"- 输入 {i}: 读取 `{d}` 中的所有文件" for i, d in enumerate(input_dirs)
@@ -167,7 +175,11 @@ def execute_prompt(
     output_dir: str,
     reasoning_path: str = "",
 ) -> str:
-    """EXECUTE: Student 按当前 Skill 执行单个输入。"""
+    """EXECUTE 阶段 / Execute stage.
+
+    让 Student 仅依据当前 skill 执行单个输入。
+    Ask the Student to process one input using only the current skill.
+    """
 
     reasoning_section = ""
     if reasoning_path:
@@ -206,7 +218,11 @@ def evaluate_prompt(
     iteration: int,
     failure_modes_path: str = "",
 ) -> str:
-    """EVALUATE: Teacher 逐条检查 assertions。"""
+    """EVALUATE 阶段 / Evaluate stage.
+
+    让 Teacher 按 assertions 逐条评分并输出结构化结果。
+    Ask the Teacher to score each assertion and emit structured results.
+    """
 
     output_list = "\n".join(
         f"- 输出 {i}: 读取 `{d}` 中的所有文件" for i, d in enumerate(output_dirs)
@@ -315,9 +331,15 @@ def optimize_prompt(
     blind_eval_path: str = "",
     failure_modes_path: str = "",
 ) -> str:
-    """OPTIMIZE: Teacher 分析失败项，迁移知识到 Skill。"""
+    """OPTIMIZE 阶段 / Optimize stage.
+
+    让 Teacher 分析失败项，并把高杠杆知识迁移回 skill。
+    Ask the Teacher to analyze failures and migrate high-leverage knowledge
+    back into the skill.
+    """
 
     # 额外评估数据（对比信号 + Student 自省）
+    # Extra evaluation signals, including output diffs and Student introspection.
     extra_eval_section = ""
     if diff_eval_path:
         extra_eval_section += f"""
@@ -371,6 +393,7 @@ def optimize_prompt(
 不要为了局部措辞优化而忽略高影响失败。"""
 
     # baseline 目录（用于截取正例片段）
+    # Baseline directory, used as the source of positive examples.
     baseline_section = ""
     if baseline_dir:
         baseline_section = f"""
@@ -489,7 +512,12 @@ def diff_evaluate_prompt(
     diff_eval_path: str,
     failure_modes_path: str = "",
 ) -> str:
-    """DIFF_EVALUATE: Teacher 逐段对比标杆输出与 Student 输出。"""
+    """DIFF_EVALUATE 阶段 / Diff-evaluate stage.
+
+    对比 Teacher benchmark 与 Student 输出，发现断言尚未覆盖的差距。
+    Compare Teacher benchmark and Student outputs to find gaps not yet covered
+    by assertions.
+    """
 
     output_list = "\n".join(
         f"- Student 输出 {i}: 读取 `{d}` 中的所有文件" for i, d in enumerate(output_dirs)
@@ -567,7 +595,11 @@ def reasoning_diff_prompt(
     input_count: int,
     reasoning_diff_path: str,
 ) -> str:
-    """REASONING_DIFF: Teacher 对比两份 reasoning，诊断 Student 的认知偏差。"""
+    """REASONING_DIFF 阶段 / Reasoning-diff stage.
+
+    对比 Teacher 与 Student 的 reasoning，定位认知偏差。
+    Compare Teacher and Student reasoning to diagnose cognitive gaps.
+    """
 
     return f"""你是认知诊断专家（Teacher），负责对比 Teacher 与 Student 的推理过程，找出 Student 的认知偏差。
 

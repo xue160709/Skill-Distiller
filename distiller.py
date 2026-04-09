@@ -1,8 +1,12 @@
-"""Skill Distiller — 自动化知识蒸馏。
+"""Skill Distiller — 自动化知识蒸馏 / automated skill distillation.
 
 Usage:
     python distiller.py
     python distiller.py path/to/config.json
+
+这个模块是项目唯一入口，负责驱动完整的蒸馏状态机。
+This module is the single entrypoint and drives the full distillation state
+machine.
 """
 
 import io
@@ -46,7 +50,7 @@ _DEFAULT_ARTIFACT_ASSERTION_IDS = {
 
 
 def init_run_log(run_dir: Path) -> Path:
-    """在工作区创建 distiller.log，用于镜像终端输出与子进程详情。"""
+    """初始化运行日志 / Create `distiller.log` for mirrored terminal output."""
     global _RUN_LOG_PATH
     p = run_dir / "distiller.log"
     _RUN_LOG_PATH = p
@@ -71,7 +75,7 @@ def _append_run_log(text: str) -> None:
 
 
 def run_log_print(*args, sep: str = " ", end: str = "\n", file=None, flush: bool = False) -> None:
-    """与 print 相同，并追加相同内容到 distiller.log（若已 init_run_log）。"""
+    """镜像打印 / Print to terminal and append the same content to `distiller.log`."""
     if file is None:
         file = sys.stdout
     buf = io.StringIO()
@@ -80,11 +84,11 @@ def run_log_print(*args, sep: str = " ", end: str = "\n", file=None, flush: bool
     print(*args, sep=sep, end=end, file=file, flush=flush)
 
 
-# ─── 配置 & 发现 ───────────────────────────────────────────
+# ─── 配置 & 发现 / Config and discovery ───────────────────
 
 
 def load_config(path: Path) -> dict:
-    """读取并校验 config.json。"""
+    """读取并校验配置 / Load and validate `config.json`."""
     cfg = json.loads(path.read_text(encoding="utf-8"))
     student_env = cfg.get("student", {}).get("env", {})
     if not student_env.get("ANTHROPIC_MODEL"):
@@ -92,7 +96,8 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("max_iterations", 15)
     cfg.setdefault("target_pass_rate", 0.90)
     cfg.setdefault("plateau_rounds", 3)
-    # 子进程 claude -p 单次最长等待（秒）。可在 JSON 里用 max_runtime_seconds 显式配置（优先于 timeout）。
+    # 子进程 `claude -p` 的单次最长等待时间（秒）。
+    # Per-subprocess timeout in seconds; `max_runtime_seconds` takes precedence.
     cfg.setdefault("timeout", 1200)
     if "max_runtime_seconds" in cfg:
         cfg["timeout"] = int(cfg["max_runtime_seconds"])
@@ -109,7 +114,7 @@ def load_config(path: Path) -> dict:
 
 
 def discover_skill(skill_root: Path) -> tuple[str, Path]:
-    """在 SKILL/ 下找唯一子目录（含 SKILL.md）。"""
+    """发现唯一 skill 目录 / Find the unique skill directory under `SKILL/`."""
     if not skill_root.is_dir():
         sys.exit(f"目录不存在: {skill_root}")
     subdirs = [d for d in skill_root.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
@@ -122,7 +127,7 @@ def discover_skill(skill_root: Path) -> tuple[str, Path]:
 
 
 def discover_inputs(input_root: Path) -> list[Path]:
-    """在 Input/ 下找所有子目录作为输入 case。"""
+    """发现所有输入 case / Discover all case directories under `Input/`."""
     if not input_root.is_dir():
         sys.exit(f"目录不存在: {input_root}")
     dirs = sorted(d for d in input_root.iterdir() if d.is_dir() and not d.name.startswith("."))
@@ -131,7 +136,7 @@ def discover_inputs(input_root: Path) -> list[Path]:
     return dirs
 
 
-# ─── 子进程 ────────────────────────────────────────────────
+# ─── 子进程 / Subprocess orchestration ────────────────────
 
 
 def run_claude(
@@ -141,7 +146,10 @@ def run_claude(
     timeout: int = 600,
     log_label: str = "claude",
 ) -> tuple[str, str, int]:
-    """调用 claude -p 子进程。"""
+    """调用 `claude -p` / Invoke the `claude -p` subprocess."""
+    # 移除外层会话变量，避免把当前代理上下文错误传给子进程。
+    # Remove outer-session variables so the subprocess does not inherit the
+    # current agent context by mistake.
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     role_env = env_config.get("env", {})
     if role_env:
@@ -273,11 +281,11 @@ def _assertion_applies_to_input(assertion: dict, input_id: int) -> bool:
     return True
 
 
-# ─── Workspace ─────────────────────────────────────────────
+# ─── Workspace / Run workspace management ─────────────────
 
 
 def _replace_dir(src: Path, dst: Path) -> None:
-    """用 src 的完整内容替换 dst。"""
+    """目录替换 / Replace `dst` with a full copy of `src`."""
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
@@ -290,21 +298,23 @@ def setup_workspace(
     config_path: Path | None = None,
     input_case_count: int | None = None,
 ) -> tuple[Path, Path]:
-    """初始化本次运行目录，安装 skill。
+    """初始化运行目录并安装 skill / Initialize workspace and install the skill.
 
-    返回: (run_dir, installed_skill_dir)
+    返回 / Returns: `(run_dir, installed_skill_dir)`.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     run_dir = workspace_root / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "baseline").mkdir(exist_ok=True)
 
-    # 备份原始 skill
+    # 备份原始 skill，供回滚、恢复和最终报告引用。
+    # Snapshot the original skill so rollback, resume, and reporting have a stable base.
     src_skill_md = skill_folder / "SKILL.md"
     shutil.copy2(src_skill_md, run_dir / "skill_v0.md")
     _replace_dir(skill_folder, run_dir / "skill_v0")
 
-    # 安装 skill 到 .claude/skills/
+    # 安装到 `.claude/skills/`，让后续子进程通过统一路径发现 skill。
+    # Install into `.claude/skills/` so later subprocesses discover the skill consistently.
     installed_dir = PROJECT_ROOT / ".claude" / "skills" / skill_name
     _replace_dir(skill_folder, installed_dir)
 
@@ -325,7 +335,7 @@ def setup_workspace(
 
 
 def _load_log_entries(log_path: Path) -> list[dict]:
-    """读取 log.json，容忍不存在或旧格式异常。"""
+    """读取结构化日志 / Read `log.json` with light backward-compat tolerance."""
     if not log_path.exists():
         return []
     try:
@@ -338,7 +348,7 @@ def _load_log_entries(log_path: Path) -> list[dict]:
 
 
 def _validate_resume_workspace(run_dir: Path, skill_name: str) -> None:
-    """校验恢复目录的关键产物与 skill 一致性。"""
+    """校验恢复目录 / Validate resume artifacts and skill consistency."""
     if not run_dir.is_dir():
         sys.exit(f"恢复失败: Workspace 不存在: {run_dir}")
 
@@ -373,7 +383,7 @@ def _validate_resume_workspace(run_dir: Path, skill_name: str) -> None:
 
 
 def _read_skill_snapshot_text(skill_source: Path) -> str:
-    """读取 skill 快照中的 SKILL.md 文本，兼容目录和单文件。"""
+    """读取 skill 快照文本 / Read `SKILL.md` from a directory or file snapshot."""
     if skill_source.is_dir():
         skill_md = skill_source / "SKILL.md"
     else:
@@ -384,7 +394,7 @@ def _read_skill_snapshot_text(skill_source: Path) -> str:
 
 
 def _install_skill_snapshot(skill_source: Path, installed_dir: Path, base_skill_dir: Path) -> None:
-    """将 skill 快照安装到 .claude/skills/，兼容目录和单文件快照。"""
+    """安装 skill 快照 / Install a skill snapshot into `.claude/skills/`."""
     if skill_source.is_dir():
         _replace_dir(skill_source, installed_dir)
         return
@@ -397,7 +407,7 @@ def _install_skill_snapshot(skill_source: Path, installed_dir: Path, base_skill_
 
 
 def _iter_skill_snapshot(iter_dir: Path) -> Path | None:
-    """返回某轮 optimize 产出的 skill 快照路径，兼容新旧布局。"""
+    """定位某轮 skill 快照 / Locate the optimized skill snapshot for one iteration."""
     new_layout = iter_dir / "skill" / "SKILL.md"
     if new_layout.exists():
         return iter_dir / "skill"
@@ -409,7 +419,7 @@ def _iter_skill_snapshot(iter_dir: Path) -> Path | None:
 
 
 def _last_logged_iteration(history: list[dict]) -> int:
-    """返回 log 中最后一个 iteration 编号。"""
+    """返回最后一个 iteration / Return the last logged iteration number."""
     last_iteration = -1
     for entry in history:
         value = entry.get("iteration")
@@ -419,7 +429,7 @@ def _last_logged_iteration(history: list[dict]) -> int:
 
 
 def _detect_next_iteration(run_dir: Path, history: list[dict], max_iterations: int) -> int:
-    """计算恢复时应从哪一轮开始。"""
+    """计算恢复起点 / Decide which iteration a resumed run should restart from."""
     last_iteration = _last_logged_iteration(history)
     next_iteration = last_iteration + 1
 
@@ -430,7 +440,7 @@ def _detect_next_iteration(run_dir: Path, history: list[dict], max_iterations: i
 
 
 def load_resume_state(run_dir: Path, skill_name: str, config: dict) -> dict:
-    """从已有 workspace 重建恢复所需状态。"""
+    """重建恢复状态 / Reconstruct in-memory state from an existing workspace."""
     _validate_resume_workspace(run_dir, skill_name)
 
     installed_skill_dir = PROJECT_ROOT / ".claude" / "skills" / skill_name
@@ -506,7 +516,7 @@ def load_resume_state(run_dir: Path, skill_name: str, config: dict) -> dict:
     }
 
 
-# ─── 管道步骤 ──────────────────────────────────────────────
+# ─── 管道步骤 / Pipeline stages ───────────────────────────
 
 
 def step_baseline(
@@ -515,7 +525,7 @@ def step_baseline(
     input_dirs: list[Path],
     run_dir: Path,
 ) -> None:
-    """BASELINE: Teacher 执行标杆 + 推理 + 提取 assertions。"""
+    """BASELINE 步骤 / Run Teacher baseline generation."""
     baseline_dir = run_dir / "baseline"
     assertions_path = run_dir / "assertions.json"
     failure_modes_path = run_dir / "failure_modes.json"
@@ -563,7 +573,7 @@ def step_execute(
     input_dirs: list[Path],
     iter_dir: Path,
 ) -> None:
-    """EXECUTE: Student 逐个输入执行 Skill + 推理。"""
+    """EXECUTE 步骤 / Run the Student on every input case."""
     for i, inp_dir in enumerate(input_dirs):
         output_dir = iter_dir / f"output_{i}"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -594,7 +604,7 @@ def step_evaluate(
     run_dir: Path,
     iteration: int,
 ) -> dict | None:
-    """EVALUATE: Teacher 逐条检查 assertions。返回 eval 结果或 None。"""
+    """EVALUATE 步骤 / Evaluate assertions and return merged results."""
     eval_path = iter_dir / "eval.json"
     assertions_path = run_dir / "assertions.json"
     failure_modes_path = run_dir / "failure_modes.json"
@@ -607,6 +617,8 @@ def step_evaluate(
         return None
 
     code_assertions, judge_assertions = _split_assertions(assertions)
+    # 先跑确定性检查，再跑 Teacher judge，最后合并成统一的 eval 视图。
+    # Run deterministic checks first, then Teacher judging, then merge both into one eval view.
     code_eval_result = _evaluate_code_assertions(code_assertions, output_dirs) if code_assertions else None
     judge_eval_result = None
 
@@ -664,7 +676,7 @@ def step_diff_evaluate(
     iter_dir: Path,
     run_dir: Path,
 ) -> None:
-    """DIFF_EVALUATE: Teacher 逐段对比标杆输出与 Student 输出。"""
+    """DIFF_EVALUATE 步骤 / Compare Teacher baseline with Student outputs."""
     baseline_dir = run_dir / "baseline"
     diff_eval_path = iter_dir / "diff_eval.json"
     failure_modes_path = run_dir / "failure_modes.json"
@@ -692,7 +704,8 @@ def step_diff_evaluate(
         run_log_print("  [WARN] diff_eval.json 未生成", file=sys.stderr)
         return
 
-    # 将 suggested_assertions 自动追加到主 assertions
+    # 将 diff 阶段产生的 suggested assertions 自动并回主断言集。
+    # Automatically merge suggested assertions from diff analysis into the master set.
     try:
         diffs = json.loads(diff_eval_path.read_text(encoding="utf-8"))
         new_assertions = []
@@ -713,11 +726,12 @@ def step_reasoning_diff(
     iter_dir: Path,
     run_dir: Path,
 ) -> None:
-    """REASONING_DIFF: Teacher 对比两份 reasoning，诊断 Student 认知偏差。"""
+    """REASONING_DIFF 步骤 / Diagnose reasoning gaps between Teacher and Student."""
     baseline_dir = run_dir / "baseline"
     reasoning_diff_path = iter_dir / "reasoning_diff.json"
 
-    # 检查 Student 是否产出了 reasoning 文件
+    # 只有 Student 产出了 reasoning 文件，认知对比才有意义。
+    # Reasoning comparison only makes sense if the Student actually produced reasoning files.
     has_reasoning = any((iter_dir / f"reasoning_{i}.md").exists() for i in range(len(input_dirs)))
     if not has_reasoning:
         run_log_print("  [WARN] Student 未产出 reasoning 文件，跳过推理对比", file=sys.stderr)
@@ -752,7 +766,7 @@ def step_blind_eval(
     run_dir: Path,
     iteration: int,
 ) -> dict | None:
-    """BLIND_EVAL: Teacher 不看 assertions，直接对 Student 输出打分。"""
+    """BLIND_EVAL 步骤 / Score outputs without looking at assertions."""
     blind_eval_path = iter_dir / "blind_eval.json"
     failure_modes_path = run_dir / "failure_modes.json"
     output_dirs = [str(iter_dir / f"output_{i}") for i in range(len(input_dirs))]
@@ -786,7 +800,7 @@ def step_blind_eval(
 
 
 def _is_probably_text_file(path: Path) -> bool:
-    """粗略判断文件是否适合按文本读取。"""
+    """粗略判断文本文件 / Heuristically decide whether a file is readable as text."""
     if path.suffix.lower() in TEXT_FILE_EXTENSIONS:
         return True
     try:
@@ -797,7 +811,7 @@ def _is_probably_text_file(path: Path) -> bool:
 
 
 def _read_text_file(path: Path) -> str:
-    """尽量稳健地读取文本文件。"""
+    """稳健读取文本 / Read a text file defensively."""
     try:
         return path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -805,7 +819,7 @@ def _read_text_file(path: Path) -> str:
 
 
 def _collect_output_files(output_dir: Path, relative_path: str = "") -> list[Path]:
-    """收集输出目录中的目标文件。"""
+    """收集输出文件 / Collect target files from an output directory."""
     if relative_path:
         target = output_dir / relative_path
         return [target] if target.exists() and target.is_file() else []
@@ -813,7 +827,7 @@ def _collect_output_files(output_dir: Path, relative_path: str = "") -> list[Pat
 
 
 def _collect_text_blobs(output_dir: Path, relative_path: str = "") -> list[tuple[str, str]]:
-    """读取输出目录中的文本内容。"""
+    """读取文本内容块 / Read text blobs from an output directory."""
     blobs: list[tuple[str, str]] = []
     for path in _collect_output_files(output_dir, relative_path):
         if not _is_probably_text_file(path):
@@ -826,12 +840,12 @@ def _collect_text_blobs(output_dir: Path, relative_path: str = "") -> list[tuple
 
 
 def _normalize_search_text(text: str, case_sensitive: bool) -> str:
-    """根据大小写配置归一化待搜索文本。"""
+    """规整搜索文本 / Normalize search text according to case sensitivity."""
     return text if case_sensitive else text.lower()
 
 
 def _count_sentences(text: str) -> int:
-    """粗略统计段落句数。"""
+    """粗略统计句数 / Roughly count the number of sentences."""
     stripped = text.strip()
     if not stripped:
         return 0
@@ -842,7 +856,7 @@ def _count_sentences(text: str) -> int:
 
 
 def _evaluate_code_assertion_on_output(assertion: dict, output_dir: Path) -> dict:
-    """对单个输出目录执行确定性 assertion 检查。"""
+    """执行单个 code assertion / Run one deterministic assertion on one output."""
     code_check = assertion.get("code_check", {}) or {}
     check_type = code_check.get("type")
     relative_path = code_check.get("path", "")
@@ -852,6 +866,8 @@ def _evaluate_code_assertion_on_output(assertion: dict, output_dir: Path) -> dic
     joined_text = "\n".join(text for _, text in text_blobs)
     haystack = _normalize_search_text(joined_text, case_sensitive)
 
+    # 统一 pass/fail 记录结构，降低后续 merge 逻辑分支复杂度。
+    # Normalize pass/fail record structure so downstream merge logic stays simple.
     def fail(evidence: str, gap: str) -> dict:
         return {
             "id": assertion.get("id", "unknown"),
@@ -954,7 +970,7 @@ def _evaluate_code_assertion_on_output(assertion: dict, output_dir: Path) -> dic
 
 
 def _evaluate_code_assertions(assertions: list[dict], output_dirs: list[str]) -> dict:
-    """对全部样本执行确定性 assertion 检查。"""
+    """批量执行 code assertions / Run deterministic assertions on all samples."""
     samples = []
     for i, output_dir in enumerate(output_dirs):
         applicable_assertions = [
@@ -969,7 +985,7 @@ def _evaluate_code_assertions(assertions: list[dict], output_dirs: list[str]) ->
     return {"samples": samples}
 
 def _summarize_weighted_results(results: list[dict], assertions_by_id: dict[str, dict]) -> tuple[float, float]:
-    """按断言权重回算 sample 级 pass_rate。"""
+    """按权重汇总分数 / Recompute pass rate and weighted pass rate."""
     if not results:
         return 0.0, 0.0
     total = len(results)
@@ -987,6 +1003,8 @@ def _summarize_weighted_results(results: list[dict], assertions_by_id: dict[str,
             failed_critical += 1
     pass_rate = passed / total if total else 0.0
     weighted = passed_weight / total_weight if total_weight else 0.0
+    # 当高权重关键项失败时封顶，避免低价值格式项掩盖真正问题。
+    # Cap the score when critical assertions fail so minor wins cannot hide major gaps.
     if failed_critical >= 2:
         weighted = min(weighted, _MULTI_CRITICAL_FAIL_CAP)
     elif failed_critical == 1:
@@ -1001,7 +1019,7 @@ def _score_results_subset(
     layer: str | None = None,
     evaluation_method: str | None = None,
 ) -> tuple[float, float] | None:
-    """按 layer / evaluation_method 过滤后回算分数。"""
+    """子集打分 / Recompute subset scores after filtering by layer or method."""
     filtered = []
     for result in results:
         assertion = assertions_by_id.get(result.get("id", ""), {})
@@ -1016,7 +1034,7 @@ def _score_results_subset(
 
 
 def _artifact_gate_passed(results: list[dict], assertions_by_id: dict[str, dict]) -> bool:
-    """artifact 层的 code assertions 必须全部通过。"""
+    """artifact gate 规则 / All artifact-layer code assertions must pass."""
     artifact_code_results = []
     for result in results:
         assertion = assertions_by_id.get(result.get("id", ""), {})
@@ -1035,7 +1053,7 @@ def _merge_eval_results(
     iteration: int,
     sample_count: int,
 ) -> dict:
-    """合并 code / judge 评测结果，并统一回算总分。"""
+    """合并评测结果 / Merge code and judge evaluations into one normalized result."""
     assertions_by_id = {a.get("id", ""): a for a in assertions}
     code_samples = {s.get("input_id"): s for s in (code_eval_result or {}).get("samples", [])}
     judge_samples = {s.get("input_id"): s for s in (judge_eval_result or {}).get("samples", [])}
@@ -1126,7 +1144,7 @@ def _merge_eval_results(
 
 
 def _normalize_text_list(values: list) -> list[str]:
-    """规整字符串列表，保留顺序并去重。"""
+    """规整字符串列表 / Normalize a text list while preserving order and uniqueness."""
     normalized: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -1144,7 +1162,7 @@ def _normalize_text_list(values: list) -> list[str]:
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
-    """将文本转成适合作为 assertion id 的 slug。"""
+    """生成断言 ID / Convert free text into a stable assertion slug."""
     chars = []
     prev_underscore = False
     for ch in text.lower():
@@ -1165,7 +1183,7 @@ def _slugify(text: str, max_len: int = 40) -> str:
 
 
 def _extract_uncovered_dimensions(blind_result: dict | None) -> list[str]:
-    """从 blind eval 中提取值得回灌 assertions 的维度。"""
+    """提取 blind-eval 漏评维度 / Extract uncovered dimensions from blind eval."""
     if not blind_result:
         return []
 
@@ -1180,7 +1198,7 @@ def _extract_uncovered_dimensions(blind_result: dict | None) -> list[str]:
 
 
 def _compute_overall_blind_score(blind_result: dict | None) -> float:
-    """读取或回算 overall_blind_score。"""
+    """读取或回算盲评分 / Read or reconstruct `overall_blind_score`."""
     if not blind_result:
         return 0.0
     score = blind_result.get("overall_blind_score")
@@ -1207,7 +1225,7 @@ def _compute_overall_blind_score(blind_result: dict | None) -> float:
 
 
 def _merge_assertions_list(run_dir: Path, new_assertions: list[dict]) -> None:
-    """将一组 assertions 追加到主 assertions.json。"""
+    """合并新断言 / Append new assertions into the master `assertions.json`."""
     master_path = run_dir / "assertions.json"
     try:
         existing = _load_assertions(master_path)
@@ -1225,7 +1243,7 @@ def _merge_assertions_list(run_dir: Path, new_assertions: list[dict]) -> None:
 
 
 def _build_knowledge_candidates(iter_dir: Path) -> Path | None:
-    """汇总 diff / reasoning diff 中最值得写回 Skill 的知识候选。"""
+    """汇总知识候选 / Build a compact knowledge-candidate summary for optimize."""
     sections: list[str] = []
 
     diff_path = iter_dir / "diff_eval.json"
@@ -1297,7 +1315,7 @@ def step_score(
     best_skill: str,
     current_skill: str,
 ) -> tuple[float, str, str]:
-    """SCORE: artifact gate + core score 决定保留或丢弃。"""
+    """SCORE 步骤 / Decide keep vs discard using artifact gate and core score."""
     if eval_result is None:
         return best_core_score, best_skill, "discard"
 
@@ -1318,13 +1336,15 @@ def step_optimize(
     run_dir: Path,
     iteration: int,
 ) -> str | None:
-    """OPTIMIZE: Teacher 迁移知识到 Skill。返回新 skill 内容或 None。"""
+    """OPTIMIZE 步骤 / Ask Teacher to update the skill and return new content."""
     output_skill_dir = iter_dir / "skill"
     output_skill_path = output_skill_dir / "SKILL.md"
     change_path = iter_dir / "change.md"
     new_assertions_path = iter_dir / "new_assertions.json"
     knowledge_path = _build_knowledge_candidates(iter_dir)
 
+    # 仅传入当前轮真实存在的分析产物，避免 prompt 指向不存在的文件。
+    # Only pass artifacts that actually exist in this iteration to avoid dangling file references.
     prompt = optimize_prompt(
         skill_dir=str(installed_skill_dir),
         eval_path=str(iter_dir / "eval.json"),
@@ -1394,11 +1414,11 @@ def _merge_assertions(run_dir: Path, new_path: Path) -> None:
     master_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-# ─── 收敛 & 日志 ──────────────────────────────────────────
+# ─── 收敛 & 日志 / Convergence and logging ────────────────
 
 
 def _is_plateau(history: list[dict], config: dict) -> bool:
-    """检查是否处于 plateau 状态（不触发终止）。"""
+    """检查平台期 / Detect whether best-score improvement has plateaued."""
     n = config["plateau_rounds"]
     if len(history) < n:
         return False
@@ -1413,7 +1433,11 @@ def should_stop(
     optimize_rounds_completed: int = 0,
     blind_eval_override: bool = False,
 ) -> tuple[bool, str]:
-    """检查终止条件。blind_eval_override=True 时覆盖 plateau 判定。"""
+    """检查终止条件 / Evaluate stopping conditions.
+
+    当 `blind_eval_override=True` 时，即使出现 plateau 也继续跑。
+    When `blind_eval_override=True`, plateau-based stopping is suppressed.
+    """
     if len(history) < config.get("min_iterations_before_stop", 1):
         return False, ""
     if optimize_rounds_completed < config.get("min_optimize_rounds", 0):
@@ -1433,7 +1457,7 @@ def should_stop(
 
 
 def append_log(log_path: Path, entry: dict) -> None:
-    """追加一条记录到 log.json。"""
+    """追加运行日志 / Append one structured entry to `log.json`."""
     if log_path.exists():
         log = json.loads(log_path.read_text(encoding="utf-8"))
     else:
@@ -1443,7 +1467,7 @@ def append_log(log_path: Path, entry: dict) -> None:
 
 
 def _extract_failed(eval_result: dict | None) -> list[str]:
-    """从 eval 结果提取 failed assertion ids。"""
+    """提取失败断言 ID / Extract failed assertion IDs from an eval result."""
     if not eval_result:
         return []
     failed = []
@@ -1457,7 +1481,7 @@ def _extract_failed(eval_result: dict | None) -> list[str]:
 
 
 def generate_report(run_dir: Path) -> None:
-    """生成 report.md。"""
+    """生成运行报告 / Generate `report.md` for the completed run."""
     log_path = run_dir / "log.json"
     if not log_path.exists():
         return
@@ -1470,7 +1494,8 @@ def generate_report(run_dir: Path) -> None:
     final_best = log[-1]["best_score"]
     total_iters = len(log)
 
-    # assertions 数量
+    # assertions 数量统计，帮助观察评测闭环是否在逐轮变完整。
+    # Assertion counts help show whether evaluation coverage is becoming more complete.
     assertions_path = run_dir / "assertions.json"
     if assertions_path.exists():
         assertions = _load_assertions(assertions_path)
@@ -1557,7 +1582,7 @@ def generate_report(run_dir: Path) -> None:
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-# ─── Finalize ──────────────────────────────────────────────
+# ─── Finalize / Final output ──────────────────────────────
 
 
 def finalize(
@@ -1566,17 +1591,18 @@ def finalize(
     final_root: Path,
     run_dir: Path,
 ) -> None:
-    """复制最佳 skill 到 Final/，生成报告。"""
+    """收尾阶段 / Copy the best skill to `Final/` and generate the report."""
     final_dir = final_root / skill_name
     _replace_dir(best_skill_dir, final_dir)
 
     generate_report(run_dir)
 
 
-# ─── 主入口 ────────────────────────────────────────────────
+# ─── 主入口 / Main entrypoint ─────────────────────────────
 
 
 def main():
+    """程序主入口 / Program entrypoint."""
     if len(sys.argv) > 3:
         sys.exit("Usage: python distiller.py [config.json] [Workspace/<timestamp>]")
 
@@ -1650,13 +1676,15 @@ def main():
             shutil.rmtree(iter_dir)
         iter_dir.mkdir(exist_ok=True)
 
-        # EXECUTE
+        # EXECUTE：让 Student 用当前 skill 真正跑一遍输入。
+        # EXECUTE: run the Student with the current skill on real inputs.
         run_log_print(f"\n[ITER {iteration}] Student 执行中...")
         t0 = time.time()
         step_execute(config, skill_name, input_dirs, iter_dir)
         run_log_print(f"  执行完成 ({time.time() - t0:.0f}s)")
 
-        # EVALUATE
+        # EVALUATE：先 deterministic，再 Teacher judge，最后汇总。
+        # EVALUATE: deterministic checks first, then Teacher judging, then merge.
         run_log_print(f"[ITER {iteration}] Teacher 评估中...")
         t0 = time.time()
         eval_result = step_evaluate(config, input_dirs, iter_dir, run_dir, iteration)
@@ -1666,19 +1694,22 @@ def main():
         core_score = eval_result.get("overall_core_weighted_pass_rate", 0.0) if eval_result else 0.0
         artifact_gate_passed = bool(eval_result.get("artifact_gate_passed", False)) if eval_result else False
 
-        # DIFF_EVALUATE — 对比信号
+        # DIFF_EVALUATE：看“哪里不一样”，帮助发现 assertions 漏掉的维度。
+        # DIFF_EVALUATE: inspect output differences to surface dimensions assertions missed.
         run_log_print(f"[ITER {iteration}] Teacher 对比评估中...")
         t0 = time.time()
         step_diff_evaluate(config, input_dirs, iter_dir, run_dir)
         run_log_print(f"  对比评估完成 ({time.time() - t0:.0f}s)")
 
-        # REASONING_DIFF — Student 自省
+        # REASONING_DIFF：看“为什么会不一样”，定位知识缺口而非只看表面结果。
+        # REASONING_DIFF: inspect why outputs differ by comparing reasoning traces.
         run_log_print(f"[ITER {iteration}] Teacher 推理对比中...")
         t0 = time.time()
         step_reasoning_diff(config, input_dirs, iter_dir, run_dir)
         run_log_print(f"  推理对比完成 ({time.time() - t0:.0f}s)")
 
-        # SCORE
+        # SCORE：只有 artifact gate 通过且 core score 创新高，候选 skill 才会被保留。
+        # SCORE: keep a candidate only if it passes the artifact gate and beats the best core score.
         best_core_score, active_skill, action = step_score(
             eval_result, best_core_score, best_skill, skill_content
         )
@@ -1696,7 +1727,8 @@ def main():
             else:
                 run_log_print(f"[ITER {iteration}] ✗ core={core_score:.2f} ≤ best={best_core_score:.2f}, rollback")
 
-        # 日志
+        # 记录本轮概要，供 resume / report / plateau 判定复用。
+        # Record an iteration summary reused by resume, reporting, and plateau detection.
         failed = _extract_failed(eval_result)
         entry = {
             "iteration": iteration,
@@ -1708,7 +1740,8 @@ def main():
             "failed": failed,
         }
 
-        # BLIND_EVAL — 覆盖率检查（每 N 轮 or plateau 时触发）
+        # BLIND_EVAL：当 assertions 与真实质量感知脱节时，用来补漏。
+        # BLIND_EVAL: a safety net that catches quality gaps not covered by assertions.
         blind_eval_override = False
         is_plateau = _is_plateau(history + [entry], config)
         should_blind_eval = (
@@ -1735,7 +1768,8 @@ def main():
                 if coverage_gap > coverage_gap_threshold:
                     run_log_print(f"  [WARN] 覆盖率缺口 {coverage_gap:.2f} > {coverage_gap_threshold}，覆盖 plateau 判定")
                     blind_eval_override = True
-                    # 将 uncovered_dimensions 转化为新 assertions
+                    # 将 uncovered dimensions 立刻转成新 assertions，扩大后续评测覆盖。
+                    # Immediately convert uncovered dimensions into assertions to widen future coverage.
                     if uncovered:
                         new_assertions = []
                         for dim in uncovered:
@@ -1747,7 +1781,8 @@ def main():
                             })
                         _merge_assertions_list(run_dir, new_assertions)
 
-        # 收敛检查
+        # 收敛检查放在 optimize 前，这样达到目标就能立即停下，不会白跑一轮。
+        # Stop before optimize once convergence is reached so we do not spend an unnecessary extra round.
         history.append(entry)
         stop, reason = should_stop(
             best_core_score,
@@ -1764,7 +1799,8 @@ def main():
 
         append_log(log_path, entry)
 
-        # OPTIMIZE
+        # OPTIMIZE：把 Teacher 的判断逻辑、规则和示例写回 skill 资产。
+        # OPTIMIZE: write Teacher logic, rules, and examples back into the skill asset.
         run_log_print(f"[ITER {iteration}] Teacher 优化中...")
         t0 = time.time()
         new_skill = step_optimize(config, installed_skill_dir, iter_dir, run_dir, iteration)
@@ -1776,7 +1812,7 @@ def main():
         else:
             run_log_print("  [WARN] 优化失败，保持当前 skill 不变")
 
-    # ── FINALIZE ──
+    # ── FINALIZE / persist the best skill and write the final report ──
     run_log_print(f"\n[FINALIZE]")
     finalize(best_skill_dir, skill_name, PROJECT_ROOT / "Final", run_dir)
     run_log_print(f"  最终 core pass_rate: {best_core_score:.2f}")
