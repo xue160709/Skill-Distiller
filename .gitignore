@@ -6,3 +6,9 @@ __pycache__/
 .DS_Store
 .env
 新手使用教程.md
+AGENTS.md
+config.run3.json
+improvement_openai.md
+evaluation_mechanism_review.md
+resume_recovery_design.md
+TEST.md
