@@ -1,95 +1,97 @@
 # Skill Distiller
 
-自动化 Skill 蒸馏系统。它把一个初始 skill 目录当作可迭代优化的对象：Teacher 先跑出标杆解法与推理，再把关键质量标准提炼成 assertions；Student 按当前 skill 执行；Teacher 评测、对比、盲评、回写知识，直到收敛。
+[中文说明](/Volumes/macOS/Github/Skill%20Distiller%20/README.zh-CN.md)
 
-> 典型用法：准备一个 skill、放几个输入 case，运行 `python distiller.py`，最后查看 `Final/<skill-name>/` 和 `Workspace/<timestamp>/report.md`。
+Skill Distiller is an automated skill-distillation system. It treats a skill directory as an optimization target: a Teacher model first produces a benchmark solution and reasoning traces, extracts quality assertions, lets a Student execute the current skill, evaluates the gap, writes back high-leverage knowledge, and iterates until the process converges.
 
-## 用途与适用场景
+> Typical usage: prepare one skill, add several input cases, run `python distiller.py`, then inspect `Final/<skill-name>/` and `Workspace/<timestamp>/report.md`.
 
-这个项目适合用来优化“已经有雏形，但质量不稳定、难以系统改进”的 skill。它特别适合下面几类场景：
+## When to use it
 
-- 写作类 skill：例如观点扩写、摘要、brief、邮件、报告生成
-- 分析类 skill：例如需求拆解、问题诊断、评审意见生成
-- 流程类 skill：例如固定输入格式下的多步处理、带模板的标准化输出
-- 需要长期维护的 skill：你不想只改一句 prompt，而是想把规则、示例、参考材料、脚本一起沉淀
+This project is designed for skills that already have a rough first version but still behave inconsistently and are hard to improve systematically. It works especially well for:
 
-它尤其适合这些问题：
+- Writing skills, such as article expansion, summarization, briefs, email drafting, or report generation
+- Analysis skills, such as requirement breakdown, diagnosis, or review comment generation
+- Process skills, such as multi-step handling under a fixed input format or template-driven output
+- Long-lived skills, where you want to preserve rules, examples, references, and scripts instead of tweaking a single prompt
 
-- 初始 skill “偶尔很好，偶尔跑偏”，缺少稳定质量
-- 你知道 Teacher 能做得更好，但不知道该把哪些知识写回 skill
-- 你希望优化的是整个 skill 资产，而不是一次性答案
-- 你需要 keep / discard / rollback 这种可回退的实验闭环
+It is especially useful when:
 
-不太适合的场景：
+- The initial skill is occasionally great but often drifts
+- You know the Teacher can do better, but you do not know what knowledge should be written back into the skill
+- You want to optimize the whole skill asset, not just a one-off answer
+- You want an experimental loop with `keep`, `discard`, and `rollback`
 
-- 只是想手工润色一次 `SKILL.md`
-- 输入 case 很少，无法形成稳定评测闭环
-- 任务本身几乎无法定义 pass/fail 或质量维度
+It is less suitable when:
 
-## Teacher 与 Student 是什么
+- You only want to manually polish one `SKILL.md`
+- You have too few input cases to build a stable evaluation loop
+- The task itself has almost no meaningful pass/fail or quality dimensions
 
-在这个项目里，Teacher 和 Student 不是两个抽象概念，而是两类扮演不同职责的模型角色：
+## Teacher and Student
 
-- `Teacher`：强模型，负责做标杆、提炼 assertions、执行 judge、做 diff / blind eval，并把高价值知识迁移回 skill
-- `Student`：较弱模型或执行代理，负责只根据当前 skill 执行任务，是检验 skill 蒸馏效果的执行者
+Teacher and Student are two model roles with different responsibilities:
 
-一个很典型的配置方式是：
+- `Teacher`: a stronger model that produces the benchmark, extracts assertions, judges outputs, runs diff and blind evaluation, and migrates high-value knowledge back into the skill
+- `Student`: a weaker model or execution agent that only follows the current skill and acts as the real test subject of the distillation loop
 
-- `Teacher` 使用更强模型，例如 `opus 4.6`
-- `Student` 使用稍弱但更便宜或更常用的模型，例如 `glm 4.7`
+A common setup is:
 
-可以把它理解成：
+- `Teacher` uses a stronger model such as `opus 4.6`
+- `Student` uses a weaker but cheaper or more representative model such as `glm 4.7`
 
-- Teacher 代表“你心目中的更强做法”或“标杆质量上限”
-- Student 代表“真实会按 skill 说明执行的较弱代理”
+You can think of them this way:
 
-所以这里蒸馏的不是 Teacher 本身，而是 Teacher 的知识如何被写进 skill，让 Student 仅靠 skill 也能更稳定地接近 Teacher。
+- Teacher represents the higher-quality approach you want
+- Student represents the weaker agent that must rely on the skill itself
 
-## 这是哪种“知识蒸馏”
+The goal is not to distill the Teacher model weights. The goal is to distill Teacher knowledge into the skill so that the Student can get much closer to Teacher-level performance by following the skill alone.
 
-这个项目确实属于知识蒸馏，但不是传统意义上的模型参数蒸馏，而是面向整个 skill 的蒸馏。
+## What kind of distillation this is
 
-更准确地说，它蒸馏的是：
+This is knowledge distillation, but not parameter distillation in the traditional ML sense. It is skill-level distillation.
 
-- Teacher 的任务完成方式
-- Teacher 的判断标准
-- Teacher 的决策规则
-- Teacher 的示例、模式和流程知识
+What gets distilled is:
 
-然后把这些知识写回 skill 目录，让较弱模型在不改权重、不做训练的前提下，也能更稳定地逼近 Teacher 的表现。
+- How the Teacher completes the task
+- What standards the Teacher uses to judge quality
+- What decision rules the Teacher follows
+- What examples, patterns, and process knowledge the Teacher relies on
 
-所以它不是：
+That knowledge is written back into the skill directory so a weaker model can perform more like the Teacher without retraining or weight changes.
 
-- logits / hidden states 层面的蒸馏
-- 训练一个新的 Student 模型
-- 把大模型权重压缩到小模型里
+So this is not:
 
-它更像是：
+- Logit or hidden-state distillation
+- Training a new Student model
+- Compressing a larger model into a smaller one
 
-- `model distillation` 之外的 `skill distillation`
-- `weights` 不变，`skill` 变强
-- 蒸馏对象是整个 skill 资产，而不是模型参数
+It is closer to:
 
-## 项目目标
+- `skill distillation` rather than `model distillation`
+- Stronger `skill`, unchanged `weights`
+- Distilling the whole skill asset rather than model parameters
 
-- 让 Skill 优化从“拍脑袋改 prompt”变成“基于评测闭环的蒸馏”
-- 用 Teacher 的推理过程提炼可复用知识，而不是只保留一次性答案
-- 通过 assertions、blind eval 和 rollback 机制，尽量减少自举漂移
+## Goals
 
-## 核心机制
+- Turn skill optimization from ad hoc prompt editing into an evaluation-driven distillation loop
+- Extract reusable knowledge from Teacher reasoning instead of preserving only one-off answers
+- Reduce self-bootstrapping drift through assertions, blind evaluation, and rollback
 
-- `baseline`：Teacher 执行当前 skill，产出标杆输出、推理、`assertions.json`、`failure_modes.json`
-- `execute`：Student 按当前安装中的 skill 执行每个输入 case，并记录自己的 reasoning
-- `evaluate`：先跑 deterministic `code` assertions，再把 `judge` assertions 交给 Teacher 判定
-- `diff_evaluate`：Teacher 对比 baseline 与 Student 输出，识别 assertions 尚未覆盖的质量差距
-- `reasoning_diff`：Teacher 对比 baseline reasoning 与 Student reasoning，定位认知偏差
-- `blind_eval`：Teacher 不看 assertions 独立打分，检测“分数看起来不错，但评测漏了关键问题”的情况
-- `optimize`：Teacher 依据 failed assertions、diff、blind eval 和 baseline reasoning，把高杠杆知识写回 skill 目录
-- `keep / discard / rollback`：只有通过 artifact gate 且 core score 创新高时才保留；否则回滚到当前 best skill
+## Core mechanism
 
-这里的“优化对象”是整个 skill 目录，而不是单独一个 `SKILL.md` 文件。当前实现会把整个 skill 安装、评估、回写和最终复制，因此 `references/`、`scripts/`、`assets/`、`agents/openai.yaml` 这类配套资源也都属于蒸馏对象的一部分。
+- `baseline`: Teacher runs the current skill and produces benchmark outputs, reasoning, `assertions.json`, and `failure_modes.json`
+- `execute`: Student runs each input case with the currently installed skill and records its own reasoning
+- `evaluate`: deterministic `code` assertions run first, then `judge` assertions are evaluated by Teacher
+- `diff_evaluate`: Teacher compares the baseline and Student outputs to find gaps not yet covered by assertions
+- `reasoning_diff`: Teacher compares baseline reasoning and Student reasoning to locate cognitive mismatch
+- `blind_eval`: Teacher scores the output without looking at assertions, to catch important issues the assertion set may have missed
+- `optimize`: Teacher writes high-leverage knowledge back into the skill directory based on failed assertions, diffs, blind eval, and baseline reasoning
+- `keep / discard / rollback`: a candidate is only kept if it passes the artifact gate and achieves a new best core score; otherwise the system rolls back to the current best skill
 
-## 主流程
+The optimization target is the entire skill directory, not just one `SKILL.md`. The current implementation installs, evaluates, rewrites, and copies the whole skill, so companion assets such as `references/`, `scripts/`, `assets/`, and `agents/openai.yaml` are all part of the distillation target.
+
+## Main loop
 
 ```text
 setup_workspace
@@ -100,36 +102,36 @@ setup_workspace
        diff_evaluate
        reasoning_diff
        score (keep / discard / rollback)
-       blind_eval (按间隔或 plateau 触发)
+       blind_eval (triggered by interval or plateau)
        optimize
   -> finalize
 ```
 
-当前实现里，真正决定 keep / discard 的是：
+In the current implementation, the real keep/discard decision is based on:
 
-- `artifact_gate_passed`：artifact 层的 `code` assertions 必须全部通过
-- `overall_core_weighted_pass_rate`：core 层加权分必须超过历史最优
+- `artifact_gate_passed`: all artifact-layer `code` assertions must pass
+- `overall_core_weighted_pass_rate`: the weighted core score must beat the historical best
 
-也就是说，`overall_weighted_pass_rate` 会被记录，但最终保留逻辑主要看 artifact gate + core score。
+`overall_weighted_pass_rate` is still recorded, but the retention logic mainly depends on the artifact gate plus core score.
 
-## 目录结构
+## Repository layout
 
 ```text
 .
-├── distiller.py              # 状态机入口
-├── prompts.py                # baseline / execute / evaluate / optimize / diff / blind eval prompts
-├── config.json               # Teacher / Student / stop 条件配置
-├── SKILL/                    # 待蒸馏 skill，要求仅保留一个有效 skill 子目录
-├── Input/                    # 输入用例，每个子目录一个 case
-├── Workspace/                # 每次运行的完整中间产物
-└── Final/                    # 最终 best skill 副本
+├── distiller.py              # State machine entrypoint
+├── prompts.py                # Prompts for baseline / execute / evaluate / optimize / diff / blind eval
+├── config.json               # Teacher / Student / stopping configuration
+├── SKILL/                    # The skill to distill; keep exactly one valid skill subdirectory here
+├── Input/                    # Input cases; each subdirectory is one case
+├── Workspace/                # Full intermediate artifacts for every run
+└── Final/                    # Final copy of the best skill
 ```
 
-`SKILL/` 下必须且只能有一个包含 `SKILL.md` 的子目录；`Input/` 下每个子目录都会被视为一个独立测试 case。
+`SKILL/` must contain exactly one subdirectory with `SKILL.md`. Every subdirectory under `Input/` is treated as an independent test case.
 
-## 快速开始
+## Quick start
 
-### 1. 准备 skill
+### 1. Prepare a skill
 
 ```text
 SKILL/
@@ -137,14 +139,14 @@ SKILL/
     └── SKILL.md
 ```
 
-当前项目会把整个 skill 目录安装到项目内的 `.claude/skills/<skill-name>/`，所以除了 `SKILL.md`，也支持一起蒸馏和复制：
+The whole skill directory is installed into `.claude/skills/<skill-name>/`, so the system can distill and copy not only `SKILL.md`, but also:
 
 - `references/`
 - `scripts/`
 - `assets/`
 - `agents/openai.yaml`
 
-### 2. 准备输入
+### 2. Prepare inputs
 
 ```text
 Input/
@@ -156,11 +158,11 @@ Input/
     └── ...
 ```
 
-每个 case 目录里的所有文件都会被 Teacher / Student 读取。
+All files inside each case directory are read by Teacher and Student.
 
-### 3. 配置模型与停止条件
+### 3. Configure models and stopping conditions
 
-最小可用配置示例：
+Minimal example:
 
 ```json
 {
@@ -183,51 +185,51 @@ Input/
 }
 ```
 
-说明：
+Notes:
 
-- 模型选择通过环境变量 `ANTHROPIC_MODEL` 注入，不走 `--model`
-- `teacher.env` / `student.env` 会直接并入各自子进程环境
-- 代码要求 `student.env.ANTHROPIC_MODEL` 必填；Teacher 可继承宿主环境
-- `max_runtime_seconds` 会覆盖旧字段 `timeout`
+- Model selection is injected through `ANTHROPIC_MODEL`, not a `--model` flag
+- `teacher.env` and `student.env` are merged directly into each subprocess environment
+- `student.env.ANTHROPIC_MODEL` is required by the code; Teacher can inherit from the host environment
+- `max_runtime_seconds` overrides the legacy `timeout` field
 
-### 4. 运行
+### 4. Run
 
-新开一轮实验：
+Start a new experiment:
 
 ```bash
 python distiller.py
 ```
 
-指定配置：
+Use an explicit config:
 
 ```bash
 python distiller.py config.json
 ```
 
-从已有 workspace 恢复：
+Resume from an existing workspace:
 
 ```bash
 python distiller.py config.json Workspace/2026-04-06_113000
 ```
 
-命令行用法：
+CLI usage:
 
 ```text
 python distiller.py [config.json] [Workspace/<timestamp>]
 ```
 
-## 运行产物
+## Run artifacts
 
-一次典型运行会生成：
+A typical run produces:
 
 ```text
 Workspace/<timestamp>/
 ├── distiller.log
 ├── run_meta.json
-├── skill_v0/                 # 初始 skill 快照
-├── best_skill/               # 当前最佳 skill 快照
-├── assertions.json           # 累积后的检查项集合，只增不减
-├── failure_modes.json        # baseline 提炼出的高价值失败模式
+├── skill_v0/                 # Snapshot of the initial skill
+├── best_skill/               # Snapshot of the current best skill
+├── assertions.json           # Accumulated assertion set; only grows
+├── failure_modes.json        # High-value failure modes extracted from baseline
 ├── baseline/
 │   ├── output_0/
 │   ├── output_1/
@@ -241,7 +243,7 @@ Workspace/<timestamp>/
 │   ├── judge_eval.json
 │   ├── diff_eval.json
 │   ├── reasoning_diff.json
-│   ├── blind_eval.json       # 仅在触发时生成
+│   ├── blind_eval.json       # Only generated when triggered
 │   ├── knowledge_candidates.md
 │   ├── skill/
 │   │   └── SKILL.md
@@ -251,49 +253,49 @@ Workspace/<timestamp>/
 └── report.md
 ```
 
-最终 best skill 会被复制到：
+The final best skill is copied to:
 
 ```text
 Final/<skill-name>/
 ```
 
-## 配置项
+## Configuration
 
-当前代码支持的主要配置如下：
+Main configuration fields supported by the current code:
 
-| 字段 | 默认值 | 作用 |
+| Field | Default | Purpose |
 |------|--------|------|
-| `max_iterations` | `15` | 最大迭代轮数 |
-| `target_pass_rate` | `0.90` | 当 `best_core_score` 达到该值时停止 |
-| `plateau_rounds` | `3` | 连续 N 轮 best score 不上涨则判定 plateau |
-| `max_runtime_seconds` / `timeout` | `1200` | 单次 `claude -p` 子进程超时秒数 |
-| `blind_eval_interval` | `3` | 每 N 轮触发一次 blind eval |
-| `coverage_gap_threshold` | `0.2` | `core_score - blind_score` 超过阈值时，覆盖 plateau 停止 |
-| `min_iterations_before_stop` | `2` | 至少跑到多少轮后才允许停止 |
-| `min_optimize_rounds` | `1` | 至少完成多少轮 optimize 后才允许停止 |
-| `critical_fail_cap` | `0.84` | 单个高权重失败项时，对 weighted score 的封顶 |
-| `multi_critical_fail_cap` | `0.72` | 两个及以上高权重失败项时，对 weighted score 的封顶 |
+| `max_iterations` | `15` | Maximum number of iterations |
+| `target_pass_rate` | `0.90` | Stop when `best_core_score` reaches this value |
+| `plateau_rounds` | `3` | Stop on plateau after N rounds without a better best score |
+| `max_runtime_seconds` / `timeout` | `1200` | Timeout in seconds for one `claude -p` subprocess call |
+| `blind_eval_interval` | `3` | Trigger blind eval every N rounds |
+| `coverage_gap_threshold` | `0.2` | If `core_score - blind_score` exceeds this value, override plateau stopping |
+| `min_iterations_before_stop` | `2` | Minimum iteration count before stopping is allowed |
+| `min_optimize_rounds` | `1` | Minimum number of completed optimize rounds before stopping is allowed |
+| `critical_fail_cap` | `0.84` | Score cap when one high-weight critical assertion fails |
+| `multi_critical_fail_cap` | `0.72` | Score cap when two or more high-weight critical assertions fail |
 
-## 评分与断言
+## Assertions and scoring
 
-assertion 支持两种评测方式：
+Assertions support two evaluation modes:
 
-- `code`：确定性检查，当前支持
+- `code`: deterministic checks, currently supporting
   - `file_exists`
   - `contains_all`
   - `contains_any`
   - `not_contains_any`
   - `max_sentences_per_paragraph`
   - `no_pattern_match`
-- `judge`：由 Teacher 结合输出证据判定
+- `judge`: decided by Teacher based on the output evidence
 
-assertion 还会被分层：
+Assertions are also layered into:
 
-- `artifact`：交付物格式与合规门槛
-- `core`：跨输入通用的关键质量标准
-- `scoped`：只适用于部分输入的标准
+- `artifact`: delivery format and compliance gates
+- `core`: cross-input quality standards
+- `scoped`: standards that only apply to some inputs
 
-合并评测结果后，每个 sample 会得到：
+After merging evaluation results, each sample gets:
 
 - `pass_rate`
 - `weighted_pass_rate`
@@ -302,34 +304,34 @@ assertion 还会被分层：
 - `core_weighted_pass_rate`
 - `scoped_weighted_pass_rate`
 
-其中有两个重要规则：
+Two important rules:
 
-1. artifact 层的 `code` assertions 必须全部通过，否则该轮直接不保留。
-2. 若有高权重失败项，weighted score 会被封顶，避免“关键问题没解决但靠格式项刷分”。
+1. All artifact-layer `code` assertions must pass, otherwise the iteration is immediately rejected.
+2. Weighted scores are capped when high-weight critical failures remain, to prevent superficial formatting wins from hiding unresolved major issues.
 
-## Blind Eval 与覆盖缺口
+## Blind eval and coverage gaps
 
-blind eval 的作用不是替代 assertions，而是发现“当前断言集漏掉了什么”。
+Blind eval does not replace assertions. It exists to discover what the current assertion set failed to capture.
 
-流程上它会：
+It:
 
-- 对输出独立打 `blind_score`
-- 提取 `weak_dimensions`
-- 产出 3-5 个 `uncovered_dimensions`
-- 计算 `coverage_gap = core_score - blind_score`
+- assigns an independent `blind_score`
+- extracts `weak_dimensions`
+- produces 3 to 5 `uncovered_dimensions`
+- computes `coverage_gap = core_score - blind_score`
 
-如果 `coverage_gap > coverage_gap_threshold`：
+If `coverage_gap > coverage_gap_threshold`:
 
-- 本轮会覆盖 plateau 停止判定，继续跑下去
-- `uncovered_dimensions` 会被自动转成新的 assertions，补进评测闭环
+- the run ignores plateau-based stopping for that round and keeps going
+- `uncovered_dimensions` are automatically converted into new assertions and added to the evaluation loop
 
-## Optimize 阶段
+## Optimize stage
 
-优化阶段不是简单重写 `SKILL.md`，而是把当前 skill 当成完整目录资产处理。
+Optimization is not just a rewrite of `SKILL.md`. The current skill is treated as a full directory asset.
 
-Teacher 会综合读取：
+Teacher reads:
 
-- 当前 skill 目录
+- the current skill directory
 - `eval.json`
 - `baseline/reasoning_*.md`
 - `diff_eval.json`
@@ -338,57 +340,57 @@ Teacher 会综合读取：
 - `blind_eval.json`
 - `failure_modes.json`
 
-并遵守以下约束：
+And it follows these constraints:
 
-- 每轮最多迁移 3 条知识
-- assertions 只增不减
-- 尽量保留原有结构，只做高价值增量修改
-- skill 长度不应失控膨胀
+- migrate at most 3 knowledge items per iteration
+- assertions only grow, never shrink
+- preserve the existing structure as much as possible and prefer high-value incremental edits
+- avoid uncontrolled skill bloat
 
-## 恢复运行
+## Resuming runs
 
-如果运行中断，可以基于已有 workspace 恢复。恢复逻辑会：
+If a run is interrupted, it can be resumed from an existing workspace. The resume flow:
 
-- 校验 `baseline/`、`assertions.json`、`skill_v0/` 等关键产物
-- 根据 `log.json` 推断下一轮 iteration
-- 重新安装当时的 current skill 与 best skill
-- 拒绝恢复已经写入 `stop_reason` 的已结束实验
+- validates required artifacts such as `baseline/`, `assertions.json`, and `skill_v0/`
+- infers the next iteration from `log.json`
+- reinstalls the saved current skill and best skill
+- refuses to resume a run that already has a recorded `stop_reason`
 
-适合的场景：
+Typical cases:
 
-- 子进程超时或模型服务中断
-- 中途手动停止
-- 想延续一轮已跑一半的实验
+- subprocess timeout or model-service interruption
+- manual stop in the middle of a run
+- continuing an experiment that was only partially completed
 
-## 报告
+## Reports
 
-每次运行结束后会在 `Workspace/<timestamp>/report.md` 生成摘要，包含：
+At the end of each run, a summary is written to `Workspace/<timestamp>/report.md`, including:
 
-- 初始 / 最终 core pass rate
-- 收敛曲线
-- 每轮 keep / discard
-- blind score 与 coverage gap
-- 当前仍未通过的 assertions
+- initial and final core pass rate
+- convergence curve
+- keep/discard decision for each iteration
+- blind score and coverage gap
+- assertions that still fail at the end
 
-## 运行依赖
+## Requirements
 
 - Python 3.10+
-- `claude` 命令可用，且支持 `claude -p`
-- 对应模型供应商所需环境变量已配置
+- `claude` available on `PATH`, with support for `claude -p`
+- the necessary environment variables for your model provider
 
-## 约束与项目约定
+## Constraints and project conventions
 
-- `distiller.py` 是唯一入口
-- 子进程调用固定在项目根目录执行，确保本地 skill 可被发现
-- 模型选择通过环境变量控制，不通过命令行 `--model`
-- `assertions.json` 采用只增不减策略
-- 不要修改 `.Codex/skills/skill-creator/` 下的文件
+- `distiller.py` is the only entrypoint
+- subprocesses always run from the project root so local skills can be discovered
+- model selection is controlled by environment variables, not `--model`
+- `assertions.json` follows an append-only strategy
+- do not modify files under `.Codex/skills/skill-creator/`
 
-## 开发提示
+## Development notes
 
-- 想覆盖完整链路，可以参考 [`TEST.md`](/Volumes/macOS/Github/Skill%20Distiller%20/TEST.md)
-- 设计恢复机制的背景说明可见 [`resume_recovery_design.md`](/Volumes/macOS/Github/Skill%20Distiller%20/resume_recovery_design.md)
-- 当前仓库里示例 skill 位于 [`SKILL/opinion-to-article/SKILL.md`](/Volumes/macOS/Github/Skill%20Distiller%20/SKILL/opinion-to-article/SKILL.md)
+- For end-to-end coverage, see [`TEST.md`](/Volumes/macOS/Github/Skill%20Distiller%20/TEST.md)
+- For background on the resume mechanism, see [`resume_recovery_design.md`](/Volumes/macOS/Github/Skill%20Distiller%20/resume_recovery_design.md)
+- The example skill in this repo is [`SKILL/opinion-to-article/SKILL.md`](/Volumes/macOS/Github/Skill%20Distiller%20/SKILL/opinion-to-article/SKILL.md)
 
 ## License
 
