@@ -6,7 +6,7 @@
   },
   "student": {
     "env": {
-      "ANTHROPIC_AUTH_TOKEN": "250c92f99eeb4a05a8eec4c4b7dc7a60.obOivZ5iOGcmW7EB",
+      "ANTHROPIC_AUTH_TOKEN": "",
       "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
       "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.1",
       "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.1",
